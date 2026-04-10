@@ -1,9 +1,11 @@
 """
 Sionna-based CSI data generator for MIMO channel simulation.
 
-This module generates realistic CSI data using Sionna's channel models,
+This module generates realistic CSI data using Sionna's channel models (v1.x),
 which capture physical wireless channel characteristics like multipath,
 fading, and MIMO properties.
+
+Compatible with Sionna 1.2.2 and later versions.
 """
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF warnings
@@ -30,7 +32,7 @@ class ChannelConfig:
     ofdm_symbols_per_slot: int = 14
 
     # Channel model parameters
-    num_paths: int = 20  # Number of multipath components
+    num_paths: int = 20  # Number of multipath components (clusters)
     delay_spread: float = 300e-9  # RMS delay spread in seconds
 
     # SNR range for training data generation
@@ -44,14 +46,14 @@ class ChannelConfig:
 
 class SionnaCSIGenerator:
     """
-    Generate downlink and uplink CSI pairs using Sionna channel models.
+    Generate downlink and uplink CSI pairs using Sionna 1.x channel models.
 
-    The generator creates realistic MIMO channel frequency responses that
-    capture:
-    - Multipath fading
-    - Spatial correlation
-    - Delay spread effects
-    - Frequency selectivity
+    The generator creates realistic MIMO channel frequency responses using:
+    - CDL (Clustered Delay Line) channel model
+    - 3GPP TR 38.901 spatial channel model
+    - Configurable antenna arrays with panel structure
+
+    This class is compatible with Sionna 1.2.2+.
     """
 
     def __init__(self, config: Optional[ChannelConfig] = None):
@@ -64,36 +66,61 @@ class SionnaCSIGenerator:
         try:
             import sionna
             self.sionna = sionna
+            self.version = getattr(sionna, '__version__', 'unknown')
+            print(f"Sionna version: {self.version}")
         except ImportError:
             raise ImportError(
                 "Sionna is required for CSI generation. "
-                "Install with: pip install sionna"
+                "Install with: pip install sionna>=1.0"
             )
 
     def _setup_channel_model(self):
-        """Initialize the Sionna channel model."""
+        """Initialize the Sionna 1.x channel model using CDL."""
         from sionna.channel import (
-            gen_single_sector_bs_ue_channels,
+            Antenna,
             AntennaArray,
-            COST
+            CDL
         )
 
-        # Configure transmit antenna array (Base Station)
+        # Configure transmit antenna array (Base Station) using Panel Array
+        # BS typically uses a large panel array with dual-polarization
         self.bs_array = AntennaArray(
+            antenna=Antenna(
+                polarization="dual",
+                polarization_type="cross",
+                antenna_pattern="38.901",  # 3GPP TR 38.901 antenna pattern
+                carrier_frequency=self.config.carrier_frequency
+            ),
             num_rows=self.config.num_tx_antennas // 8,
             num_cols=8,
-            polarization="dual",
-            pattern="tr38901",
-            carrier_frequency=self.config.carrier_frequency
+            steering="spatial"
         )
 
         # Configure receive antenna array (User Equipment)
+        # UE typically uses smaller arrays (e.g., 4x4 for mobile devices)
         self.ue_array = AntennaArray(
+            antenna=Antenna(
+                polarization="dual",
+                polarization_type="cross",
+                antenna_pattern="38.901",
+                carrier_frequency=self.config.carrier_frequency
+            ),
             num_rows=4,
             num_cols=4,
-            polarization="dual",
-            pattern="tr38901",
-            carrier_frequency=self.config.carrier_frequency
+            steering="spatial"
+        )
+
+        # Create CDL channel model (Clustered Delay Line)
+        # This is the standard 3GPP channel model for MIMO systems
+        self.cdl = CDL(
+            channel_model="C",  # CDL model: A (LOS), B, C, D, E (NLOS)
+            delay_spread=self.config.delay_spread,
+            carrier_frequency=self.config.carrier_frequency,
+            num_clusters=self.config.num_paths,
+            array_bs=self.bs_array,
+            array_ue=self.ue_array,
+            direction="downlink",
+            dtype=tf.complex64
         )
 
     def generate_channel_batch(self, batch_size: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -109,12 +136,9 @@ class SionnaCSIGenerator:
                       (real and imag for each subcarrier)
             - ul_csi: [batch_size, num_subcarriers, num_rx_antennas * num_tx_antennas * 2]
         """
-        from sionna.channel import gen_single_sector_bs_ue_channels
-        import sionna.constants as const
-
         batch_size = batch_size or self.config.batch_size
 
-        # Generate channel frequency response
+        # Generate channel frequency response using CDL model
         # Shape: [batch_size, num_subcarriers, num_rx, num_tx]
         h_freq = self._generate_freq_response(batch_size)
 
@@ -133,22 +157,71 @@ class SionnaCSIGenerator:
 
         return dl_csi, ul_csi
 
-    def _generate_freq_response(self, batch_size: int):
-        """Generate frequency response using Sionna's channel model."""
-        from sionna.channel import gen_single_sector_bs_ue_channels
+    def _generate_freq_response(self, batch_size: int) -> np.ndarray:
+        """Generate frequency response using Sionna's CDL channel model."""
+        # Generate batch of channel impulse responses
+        # Output shapes depend on the channel model configuration
+        h, tau = self.cdl(batch_size=batch_size)
 
-        # Generate channels for batch_size users
-        # Output shape: [batch_size, num_subcarriers, num_rx, num_tx]
-        h_freq = gen_single_sector_bs_ue_channels(
-            self.bs_array,
-            self.ue_array,
-            self.config.num_subcarriers,
-            self.config.num_paths,
-            batch_size=batch_size,
-            rng=None
+        # Convert to frequency response by summing over delays
+        # Shape: [batch, num_rx, num_tx, num_subcarriers]
+        num_subcarriers = self.config.num_subcarriers
+
+        # Create frequency grid
+        freq_grid = tf.constant(
+            np.linspace(-num_subcarriers/2, num_subcarriers/2 - 1, num_subcarriers),
+            dtype=tf.float32
         )
 
+        # Compute frequency response from impulse response
+        # H(f) = sum over paths: h_i * exp(-j*2*pi*f*tau_i)
+        h_freq_complex = self._impulse_to_frequency(h, tau, freq_grid)
+
+        # Transpose to [batch, num_subcarriers, num_rx, num_tx]
+        h_freq = tf.transpose(h_freq_complex, [0, 3, 1, 2])
+
         return h_freq.numpy()
+
+    def _impulse_to_frequency(self, h: tf.Tensor, tau: tf.Tensor,
+                              freq_grid: tf.Tensor) -> tf.Tensor:
+        """
+        Convert channel impulse response to frequency response.
+
+        Args:
+            h: Channel impulse response [batch, num_clusters, num_rx, num_tx]
+            tau: Path delays [batch, num_clusters]
+            freq_grid: Frequency grid [num_subcarriers]
+            batch_size: Batch size
+
+        Returns:
+            Frequency response [batch, num_subcarriers, num_rx, num_tx]
+        """
+        num_subcarriers = self.config.num_subcarriers
+        num_clusters = self.config.num_paths
+
+        # Expand dimensions for broadcasting
+        # freq_grid: [num_subcarriers] -> [num_subcarriers, 1, 1, 1]
+        # tau: [batch, num_clusters] -> [1, num_clusters, 1, 1]
+        # h: [batch, num_clusters, num_rx, num_tx]
+
+        freq_exp = tf.reshape(freq_grid, [num_subcarriers, 1, 1, 1])
+        tau_exp = tf.reshape(tau, [1, num_clusters, 1, 1])
+        h_exp = tf.expand_dims(h, 1)  # [batch, 1, num_clusters, num_rx, num_tx]
+
+        # Compute phase shift for each path and frequency
+        # exp(-j * 2 * pi * f * tau)
+        phase = tf.constant(-2 * np.pi, dtype=tf.float32)
+        phase_shift = tf.exp(phase * 1j * freq_exp * tf.cast(tau_exp, tf.complex64))
+
+        # Sum contributions from all clusters
+        # h_exp: [batch, num_sc, num_clusters, num_rx, num_tx]
+        # phase_shift: [num_sc, num_clusters, 1, 1]
+        h_expanded = tf.cast(h_exp, tf.complex64)
+        phase_shift = tf.cast(phase_shift, tf.complex64)
+
+        h_freq = tf.reduce_sum(h_expanded * phase_shift, axis=2)
+
+        return tf.transpose(h_freq, [0, 2, 3, 1])  # [batch, num_rx, num_tx, num_sc]
 
     def _freq_to_csi_features(self, h_freq: np.ndarray) -> np.ndarray:
         """

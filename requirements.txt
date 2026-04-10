@@ -10,7 +10,7 @@ peft>=0.7.0
 
 # Sionna for CSI data generation
 tensorflow>=2.12.0
-sionna
+sionna>=1.0
 
 # Utilities
 numpy>=1.24.0
