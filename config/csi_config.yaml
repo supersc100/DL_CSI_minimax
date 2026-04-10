@@ -1,0 +1,53 @@
+# CSI Feedback Model Configuration
+
+model:
+  # Path to DeepSeek model (update this to your local path)
+  deepseek_model_path: "./models/deepseek-7b"
+  
+  # Model architecture (auto-detected from DeepSeek config if not specified)
+  hidden_dim: 4096
+  max_seq_len: 2048
+  
+  # Use flash attention for better memory efficiency
+  use_flash_attention: false
+
+data:
+  # CSI data parameters
+  seq_len: 128           # Sequence length for each CSI sample
+  num_features: 2        # Real and imaginary parts
+  
+  # Normalization
+  normalize: true
+
+lora:
+  # LoRA fine-tuning configuration
+  enabled: true
+  rank: 8                # LoRA rank (common: 4, 8, 16)
+  alpha: 16              # LoRA alpha (usually 2 * rank)
+  dropout: 0.05          # LoRA dropout
+  target_modules:
+    - "q_proj"
+    - "k_proj" 
+    - "v_proj"
+    - "o_proj"
+
+training:
+  # Training hyperparameters
+  epochs: 10
+  batch_size: 16         # Adjust based on GPU memory
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  
+  # Gradient clipping
+  grad_clip: 1.0
+  
+  # Logging and checkpointing
+  eval_every: 100        # Steps between evaluations
+  save_every: 500       # Steps between checkpoints
+  log_every: 10         # Steps between log outputs
+  
+  # Limit training steps (useful for debugging)
+  max_steps: null
+  
+  # Number of data loading workers
+  num_workers: 2
