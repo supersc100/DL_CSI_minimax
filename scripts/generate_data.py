@@ -68,6 +68,25 @@ def main():
         default=128,
         help="Output sequence length for CSI data",
     )
+    parser.add_argument(
+        "--system_type",
+        type=str,
+        default="TDD",
+        choices=["TDD", "FDD"],
+        help="System type: TDD (Time Division Duplex) or FDD (Frequency Division Duplex)",
+    )
+    parser.add_argument(
+        "--dl_frequency",
+        type=float,
+        default=3.5e9,
+        help="Downlink carrier frequency in Hz (default: 3.5 GHz)",
+    )
+    parser.add_argument(
+        "--ul_frequency",
+        type=float,
+        default=2.1e9,
+        help="Uplink carrier frequency in Hz (only used for FDD, default: 2.1 GHz)",
+    )
 
     args = parser.parse_args()
 
@@ -81,18 +100,25 @@ def main():
     print(f"Subcarriers: {args.num_subcarriers}")
     print(f"TX/RX antennas: {args.num_tx}/{args.num_rx}")
     print(f"Output sequence length: {args.seq_len}")
+    print(f"System type: {args.system_type}")
 
     # Configure channel
     config = ChannelConfig(
+        system_type=args.system_type,
         num_subcarriers=args.num_subcarriers,
         num_tx_antennas=args.num_tx,
         num_rx_antennas=args.num_rx,
         batch_size=args.batch_size,
         output_seq_len=args.seq_len,
+        carrier_frequency=args.dl_frequency,
+        ul_carrier_frequency=args.ul_frequency,
     )
 
     print("\nChannel Configuration:")
-    print(f"  Carrier frequency: {config.carrier_frequency/1e9:.1f} GHz")
+    print(f"  System type: {config.system_type}")
+    print(f"  Downlink carrier frequency: {config.carrier_frequency/1e9:.2f} GHz")
+    if config.system_type.upper() == "FDD":
+        print(f"  Uplink carrier frequency: {config.ul_carrier_frequency/1e9:.2f} GHz")
     print(f"  Number of paths: {config.num_paths}")
     print(f"  Delay spread: {config.delay_spread*1e9:.1f} ns")
     print(f"  SNR range: {config.snr_db_min}-{config.snr_db_max} dB")

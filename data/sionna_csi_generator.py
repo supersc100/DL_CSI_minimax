@@ -20,8 +20,15 @@ from dataclasses import dataclass
 @dataclass
 class ChannelConfig:
     """Physical channel configuration for MIMO system."""
-    # Carrier frequency in Hz
+    # System type: "TDD" (Time Division Duplex) or "FDD" (Frequency Division Duplex)
+    system_type: str = "TDD"
+
+    # Carrier frequency in Hz (downlink for FDD, shared for TDD)
     carrier_frequency: float = 3.5e9
+
+    # Uplink carrier frequency in Hz (only used for FDD)
+    # For FDD, typical uplink is lower (e.g., 2.1 GHz for 3.5 GHz downlink)
+    ul_carrier_frequency: float = 2.1e9
 
     # Number of transmit/receive antennas
     num_tx_antennas: int = 64
@@ -74,22 +81,18 @@ class SionnaCSIGenerator:
                 "Install with: pip install sionna>=1.0"
             )
 
-    def _setup_channel_model(self):
-        """Initialize the Sionna 1.x channel model using CDL."""
-        from sionna.channel import (
-            Antenna,
-            AntennaArray,
-            CDL
-        )
+    def _create_antenna_arrays(self, carrier_frequency: float):
+        """Create antenna arrays for a given carrier frequency."""
+        from sionna.channel import Antenna, AntennaArray
 
         # Configure transmit antenna array (Base Station) using Panel Array
         # BS typically uses a large panel array with dual-polarization
-        self.bs_array = AntennaArray(
+        bs_array = AntennaArray(
             antenna=Antenna(
                 polarization="dual",
                 polarization_type="cross",
                 antenna_pattern="38.901",  # 3GPP TR 38.901 antenna pattern
-                carrier_frequency=self.config.carrier_frequency
+                carrier_frequency=carrier_frequency
             ),
             num_rows=self.config.num_tx_antennas // 8,
             num_cols=8,
@@ -98,30 +101,94 @@ class SionnaCSIGenerator:
 
         # Configure receive antenna array (User Equipment)
         # UE typically uses smaller arrays (e.g., 4x4 for mobile devices)
-        self.ue_array = AntennaArray(
+        ue_array = AntennaArray(
             antenna=Antenna(
                 polarization="dual",
                 polarization_type="cross",
                 antenna_pattern="38.901",
-                carrier_frequency=self.config.carrier_frequency
+                carrier_frequency=carrier_frequency
             ),
             num_rows=4,
             num_cols=4,
             steering="spatial"
         )
 
-        # Create CDL channel model (Clustered Delay Line)
-        # This is the standard 3GPP channel model for MIMO systems
-        self.cdl = CDL(
-            channel_model="C",  # CDL model: A (LOS), B, C, D, E (NLOS)
-            delay_spread=self.config.delay_spread,
-            carrier_frequency=self.config.carrier_frequency,
-            num_clusters=self.config.num_paths,
-            array_bs=self.bs_array,
-            array_ue=self.ue_array,
-            direction="downlink",
-            dtype=tf.complex64
-        )
+        return bs_array, ue_array
+
+    def _setup_channel_model(self):
+        """Initialize the Sionna 1.x channel model using CDL."""
+        from sionna.channel import CDL
+
+        if self.config.system_type.upper() == "FDD":
+            # For FDD: create separate channel models for DL and UL
+            # with different carrier frequencies but shared geometric parameters
+
+            # Create DL antenna arrays
+            bs_array_dl, ue_array_dl = self._create_antenna_arrays(
+                self.config.carrier_frequency
+            )
+
+            # Create UL antenna arrays (same geometry, different frequency)
+            bs_array_ul, ue_array_ul = self._create_antenna_arrays(
+                self.config.ul_carrier_frequency
+            )
+
+            # Store arrays for geometric parameter sharing
+            self.bs_array_dl = bs_array_dl
+            self.ue_array_dl = ue_array_dl
+            self.bs_array_ul = bs_array_ul
+            self.ue_array_ul = ue_array_ul
+
+            # Create CDL channel models
+            # Direction is specified in constructor
+            self.cdl_dl = CDL(
+                channel_model="C",  # CDL model: A (LOS), B, C, D, E (NLOS)
+                delay_spread=self.config.delay_spread,
+                carrier_frequency=self.config.carrier_frequency,
+                num_clusters=self.config.num_paths,
+                array_bs=bs_array_dl,
+                array_ue=ue_array_dl,
+                direction="downlink",
+                dtype=tf.complex64
+            )
+
+            self.cdl_ul = CDL(
+                channel_model="C",
+                delay_spread=self.config.delay_spread,
+                carrier_frequency=self.config.ul_carrier_frequency,
+                num_clusters=self.config.num_paths,
+                array_bs=bs_array_ul,
+                array_ue=ue_array_ul,
+                direction="uplink",
+                dtype=tf.complex64
+            )
+
+            self.cdl = None  # Not used in FDD mode
+        else:
+            # For TDD: single channel model with reciprocity
+            bs_array, ue_array = self._create_antenna_arrays(
+                self.config.carrier_frequency
+            )
+
+            self.bs_array_dl = bs_array
+            self.ue_array_dl = ue_array
+            self.bs_array_ul = bs_array  # Same arrays for TDD
+            self.ue_array_ul = ue_array
+
+            # Create single CDL channel model
+            self.cdl = CDL(
+                channel_model="C",
+                delay_spread=self.config.delay_spread,
+                carrier_frequency=self.config.carrier_frequency,
+                num_clusters=self.config.num_paths,
+                array_bs=bs_array,
+                array_ue=ue_array,
+                direction="downlink",
+                dtype=tf.complex64
+            )
+
+            self.cdl_dl = self.cdl
+            self.cdl_ul = None  # Not used in TDD mode
 
     def generate_channel_batch(self, batch_size: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -138,18 +205,22 @@ class SionnaCSIGenerator:
         """
         batch_size = batch_size or self.config.batch_size
 
-        # Generate channel frequency response using CDL model
-        # Shape: [batch_size, num_subcarriers, num_rx, num_tx]
-        h_freq = self._generate_freq_response(batch_size)
+        if self.config.system_type.upper() == "FDD":
+            # For FDD: generate DL and UL channels separately with different frequencies
+            h_freq_dl, h_freq_ul = self._generate_fdd_channels(batch_size)
 
-        # Downlink CSI: UE receives from BS
-        # Reshape to [batch, subcarriers, rx_antennas * tx_antennas * 2]
-        dl_csi = self._freq_to_csi_features(h_freq)
+            # Convert to CSI features
+            dl_csi = self._freq_to_csi_features(h_freq_dl)
+            ul_csi = self._freq_to_csi_features(h_freq_ul)
+        else:
+            # For TDD: use reciprocal channel with slight perturbation
+            h_freq = self._generate_freq_response(batch_size)
 
-        # For uplink CSI, we simulate a reciprocal channel
-        # In TDD systems, uplink and downlink channels are related by reciprocity
-        # We add slight variations to model practical impairments
-        ul_csi = self._generate_reciprocal_channel(h_freq)
+            # Downlink CSI: UE receives from BS
+            dl_csi = self._freq_to_csi_features(h_freq)
+
+            # For uplink CSI, use reciprocity with slight variations
+            ul_csi = self._generate_reciprocal_channel(h_freq)
 
         # Reshape output to [batch, seq_len, 2] format for the model
         dl_csi = self._reshape_to_seq(dl_csi)  # [batch, seq_len, 2]
@@ -216,6 +287,87 @@ class SionnaCSIGenerator:
         # Sum contributions from all clusters
         # h_exp: [batch, num_sc, num_clusters, num_rx, num_tx]
         # phase_shift: [num_sc, num_clusters, 1, 1]
+        h_expanded = tf.cast(h_exp, tf.complex64)
+        phase_shift = tf.cast(phase_shift, tf.complex64)
+
+        h_freq = tf.reduce_sum(h_expanded * phase_shift, axis=2)
+
+        return tf.transpose(h_freq, [0, 2, 3, 1])  # [batch, num_rx, num_tx, num_sc]
+
+    def _generate_fdd_channels(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate separate downlink and uplink channels for FDD systems.
+
+        In FDD systems, uplink and downlink use different carrier frequencies.
+        The channels share the same geometric parameters (path delays, angles, powers)
+        but have independent frequency responses due to the different wavelengths.
+
+        Args:
+            batch_size: Number of samples to generate
+
+        Returns:
+            Tuple of (h_freq_dl, h_freq_ul), each of shape:
+            - h_freq_dl: [batch, num_subcarriers, num_rx, num_tx]
+            - h_freq_ul: [batch, num_subcarriers, num_rx, num_tx]
+        """
+        # Generate DL channel impulse response
+        h_dl, tau_dl = self.cdl_dl(batch_size=batch_size)
+
+        # For UL, we use the same geometric parameters but generate a new realization
+        # The CDL model will produce different channel coefficients for the UL frequency
+        h_ul, _ = self.cdl_ul(batch_size=batch_size)
+
+        # Reuse tau_dl for frequency response computation to maintain path correlation
+        # This ensures both channels have the same multipath structure
+
+        num_subcarriers = self.config.num_subcarriers
+
+        # Create frequency grids for DL and UL
+        freq_grid_dl = tf.constant(
+            np.linspace(-num_subcarriers/2, num_subcarriers/2 - 1, num_subcarriers),
+            dtype=tf.float32
+        )
+        freq_grid_ul = tf.constant(
+            np.linspace(-num_subcarriers/2, num_subcarriers/2 - 1, num_subcarriers),
+            dtype=tf.float32
+        )
+
+        # Compute frequency responses
+        h_freq_dl_complex = self._impulse_to_frequency_fdd(h_dl, tau_dl, freq_grid_dl)
+        h_freq_ul_complex = self._impulse_to_frequency_fdd(h_ul, tau_dl, freq_grid_ul)  # Use same tau for correlation
+
+        # Transpose to [batch, num_subcarriers, num_rx, num_tx]
+        h_freq_dl = tf.transpose(h_freq_dl_complex, [0, 3, 1, 2]).numpy()
+        h_freq_ul = tf.transpose(h_freq_ul_complex, [0, 3, 1, 2]).numpy()
+
+        return h_freq_dl, h_freq_ul
+
+    def _impulse_to_frequency_fdd(self, h: tf.Tensor, tau: tf.Tensor,
+                                   freq_grid: tf.Tensor) -> tf.Tensor:
+        """
+        Convert channel impulse response to frequency response for FDD.
+
+        Args:
+            h: Channel impulse response [batch, num_clusters, num_rx, num_tx]
+            tau: Path delays [batch, num_clusters]
+            freq_grid: Frequency grid [num_subcarriers]
+
+        Returns:
+            Frequency response [batch, num_subcarriers, num_rx, num_tx]
+        """
+        num_subcarriers = self.config.num_subcarriers
+        num_clusters = self.config.num_paths
+
+        # Expand dimensions for broadcasting
+        freq_exp = tf.reshape(freq_grid, [num_subcarriers, 1, 1, 1])
+        tau_exp = tf.reshape(tau, [1, num_clusters, 1, 1])
+        h_exp = tf.expand_dims(h, 1)  # [batch, 1, num_clusters, num_rx, num_tx]
+
+        # Compute phase shift for each path and frequency
+        phase = tf.constant(-2 * np.pi, dtype=tf.float32)
+        phase_shift = tf.exp(phase * 1j * freq_exp * tf.cast(tau_exp, tf.complex64))
+
+        # Sum contributions from all clusters
         h_expanded = tf.cast(h_exp, tf.complex64)
         phase_shift = tf.cast(phase_shift, tf.complex64)
 

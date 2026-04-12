@@ -62,7 +62,10 @@ Output: [batch, seq_len, hidden_dim]
 
 ### Sionna数据生成
 - 基于TensorFlow，需转换为PyTorch张量
-- 信道特性：多径效应、衰落、MIMO传输、TDD reciprocity
+- 信道特性：多径效应、衰落、MIMO传输
+- 支持TDD/FDD两种系统模式：
+  - **TDD模式**: 基于信道互易性，上下行共享同一信道（添加微调扰动）
+  - **FDD模式**: 上下行使用不同载波频率，分别独立生成，共享路径延迟以保持多径相关性
 
 ## 实际文件结构
 
@@ -111,8 +114,12 @@ python scripts/download_model.py \
     --model_name deepseek-ai/deepseek-llm-7b-base \
     --output_dir ./models/deepseek-7b
 
-# 3. 生成CSI数据
+# 3. 生成CSI数据 (TDD模式，默认)
 python scripts/generate_data.py --num_samples 10000 --output_dir ./data
+
+# 3b. 生成CSI数据 (FDD模式)
+python scripts/generate_data.py --num_samples 10000 --system_type FDD \
+    --dl_frequency 3.5e9 --ul_frequency 2.1e9 --output_dir ./data
 
 # 4. 训练模型
 python scripts/train.py --config config/csi_config.yaml
@@ -139,5 +146,6 @@ python -m pytest tests/test_deepseek_csi.py -v
 
 ### `SionnaCSIGenerator`
 数据生成器，位于 [data/sionna_csi_generator.py](data/sionna_csi_generator.py)
-- `generate_channel_batch()`: 生成下行/上行CSI对
+- `generate_channel_batch()`: 生成下行/上行CSI对（支持TDD/FDD）
 - `generate_dataset()`: 保存为HDF5格式
+- 支持TDD（基于信道互易性）和FDD（独立频率信道）两种模式
