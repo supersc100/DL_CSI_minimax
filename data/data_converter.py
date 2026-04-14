@@ -1,5 +1,8 @@
 """
-Data converter for transforming TensorFlow/Sionna data to PyTorch format.
+Data converter for CSI data normalization and format handling.
+
+This module handles CSI data normalization, compatible with Sionna 2.0
+which generates data directly in NumPy/PyTorch format.
 """
 import h5py
 import numpy as np
@@ -10,10 +13,10 @@ from typing import Tuple, Optional
 
 class CSIDataConverter:
     """
-    Converts CSI data between TensorFlow and PyTorch formats.
+    Handles CSI data normalization and format transformation.
 
-    Sionna generates data using TensorFlow, but our model uses PyTorch.
-    This converter handles the format transformation and optional normalization.
+    Sionna 2.0 generates data directly in NumPy format, so this converter
+    focuses on normalization and data format operations.
     """
 
     def __init__(self, normalization_method: str = "standard"):
@@ -25,7 +28,7 @@ class CSIDataConverter:
         self.mean = None
         self.std = None
 
-    def load_tf_dataset(self, filepath: str) -> Tuple[np.ndarray, np.ndarray]:
+    def load_dataset(self, filepath: str) -> Tuple[np.ndarray, np.ndarray]:
         """Load CSI data from HDF5 file."""
         with h5py.File(filepath, 'r') as f:
             dl_csi = f['dl_csi'][:]
@@ -65,14 +68,14 @@ class CSIDataConverter:
         compute_norm: bool = True,
     ):
         """
-        Convert a dataset from TF format to PyTorch-ready format.
+        Normalize CSI data and save to HDF5.
 
         Args:
             input_path: Path to input HDF5 file
             output_path: Path to output HDF5 file
             compute_norm: Whether to compute normalization from this data
         """
-        dl_csi, ul_csi = self.load_tf_dataset(input_path)
+        dl_csi, ul_csi = self.load_dataset(input_path)
 
         if compute_norm:
             self.compute_normalization(dl_csi, ul_csi)
@@ -105,6 +108,13 @@ class CSIDataConverter:
             f.attrs['std'] = self.std
             f.attrs['normalization'] = self.normalization_method
 
+    def load_normalization_params(self, filepath: str):
+        """Load normalization parameters from file."""
+        with h5py.File(filepath, 'r') as f:
+            self.mean = f.attrs['mean']
+            self.std = f.attrs['std']
+            self.normalization_method = f.attrs['normalization']
+
 
 def convert_directory(
     input_dir: str,
@@ -112,7 +122,7 @@ def convert_directory(
     normalization_method: str = "standard",
 ) -> Tuple[str, str]:
     """
-    Convert all CSI datasets in a directory.
+    Normalize all CSI datasets in a directory.
 
     Returns:
         Tuple of (train_output_path, test_output_path)
@@ -129,8 +139,8 @@ def convert_directory(
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    train_out = f"{output_dir}/train_converted.h5"
-    test_out = f"{output_dir}/test_converted.h5"
+    train_out = f"{output_dir}/train_normalized.h5"
+    test_out = f"{output_dir}/test_normalized.h5"
 
     converter.convert(train_files[0], train_out, compute_norm=True)
     converter.convert(test_files[0], test_out, compute_norm=False)
@@ -144,7 +154,7 @@ def convert_directory(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert CSI data from TF to PyTorch format")
+    parser = argparse.ArgumentParser(description="Normalize CSI data")
     parser.add_argument("--input", required=True, help="Input HDF5 file")
     parser.add_argument("--output", required=True, help="Output HDF5 file")
     parser.add_argument("--method", default="standard", choices=["standard", "minmax"])

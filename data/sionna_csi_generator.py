@@ -1,16 +1,14 @@
 """
-Sionna-based CSI data generator for MIMO channel simulation.
+Sionna-based CSI data generator for MIMO channel simulation (Sionna 2.0).
 
-This module generates realistic CSI data using Sionna's channel models (v1.x),
+This module generates realistic CSI data using Sionna's channel models (v2.0),
 which capture physical wireless channel characteristics like multipath,
 fading, and MIMO properties.
 
-Compatible with Sionna 1.2.2 and later versions.
+Compatible with Sionna 2.0 (PyTorch-based).
 """
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF warnings
-
-import tensorflow as tf
+import torch
 import numpy as np
 import h5py
 from typing import Tuple, Optional
@@ -50,23 +48,27 @@ class ChannelConfig:
     batch_size: int = 32
     output_seq_len: int = 128  # Sequence length for CSI feedback
 
+    # CDL model type: 'A' (LOS), 'B', 'C', 'D', 'E' (NLOS)
+    cdl_model: str = 'C'
+
 
 class SionnaCSIGenerator:
     """
-    Generate downlink and uplink CSI pairs using Sionna 1.x channel models.
+    Generate downlink and uplink CSI pairs using Sionna 2.0 channel models.
 
     The generator creates realistic MIMO channel frequency responses using:
     - CDL (Clustered Delay Line) channel model
     - 3GPP TR 38.901 spatial channel model
     - Configurable antenna arrays with panel structure
 
-    This class is compatible with Sionna 1.2.2+.
+    This class is compatible with Sionna 2.0+ (PyTorch-based).
     """
 
     def __init__(self, config: Optional[ChannelConfig] = None):
         self.config = config or ChannelConfig()
         self._check_sionna_available()
         self._setup_channel_model()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def _check_sionna_available(self):
         """Verify Sionna is installed."""
@@ -78,12 +80,12 @@ class SionnaCSIGenerator:
         except ImportError:
             raise ImportError(
                 "Sionna is required for CSI generation. "
-                "Install with: pip install sionna>=1.0"
+                "Install with: pip install sionna>=2.0"
             )
 
     def _create_antenna_arrays(self, carrier_frequency: float):
         """Create antenna arrays for a given carrier frequency."""
-        from sionna.channel import Antenna, AntennaArray
+        from sionna.phy.channel.tr38901 import Antenna, AntennaArray
 
         # Configure transmit antenna array (Base Station) using Panel Array
         # BS typically uses a large panel array with dual-polarization
@@ -116,8 +118,8 @@ class SionnaCSIGenerator:
         return bs_array, ue_array
 
     def _setup_channel_model(self):
-        """Initialize the Sionna 1.x channel model using CDL."""
-        from sionna.channel import CDL
+        """Initialize the Sionna 2.0 channel model using CDL."""
+        from sionna.phy.channel.tr38901 import CDL
 
         if self.config.system_type.upper() == "FDD":
             # For FDD: create separate channel models for DL and UL
@@ -142,25 +144,23 @@ class SionnaCSIGenerator:
             # Create CDL channel models
             # Direction is specified in constructor
             self.cdl_dl = CDL(
-                channel_model="C",  # CDL model: A (LOS), B, C, D, E (NLOS)
+                model=self.config.cdl_model,  # CDL model: A (LOS), B, C, D, E (NLOS)
                 delay_spread=self.config.delay_spread,
                 carrier_frequency=self.config.carrier_frequency,
-                num_clusters=self.config.num_paths,
                 array_bs=bs_array_dl,
                 array_ue=ue_array_dl,
                 direction="downlink",
-                dtype=tf.complex64
+                dtype=torch.complex64
             )
 
             self.cdl_ul = CDL(
-                channel_model="C",
+                model=self.config.cdl_model,
                 delay_spread=self.config.delay_spread,
                 carrier_frequency=self.config.ul_carrier_frequency,
-                num_clusters=self.config.num_paths,
                 array_bs=bs_array_ul,
                 array_ue=ue_array_ul,
                 direction="uplink",
-                dtype=tf.complex64
+                dtype=torch.complex64
             )
 
             self.cdl = None  # Not used in FDD mode
@@ -177,14 +177,13 @@ class SionnaCSIGenerator:
 
             # Create single CDL channel model
             self.cdl = CDL(
-                channel_model="C",
+                model=self.config.cdl_model,
                 delay_spread=self.config.delay_spread,
                 carrier_frequency=self.config.carrier_frequency,
-                num_clusters=self.config.num_paths,
                 array_bs=bs_array,
                 array_ue=ue_array,
                 direction="downlink",
-                dtype=tf.complex64
+                dtype=torch.complex64
             )
 
             self.cdl_dl = self.cdl
@@ -239,9 +238,12 @@ class SionnaCSIGenerator:
         num_subcarriers = self.config.num_subcarriers
 
         # Create frequency grid
-        freq_grid = tf.constant(
-            np.linspace(-num_subcarriers/2, num_subcarriers/2 - 1, num_subcarriers),
-            dtype=tf.float32
+        freq_grid = torch.linspace(
+            -num_subcarriers / 2,
+            num_subcarriers / 2 - 1,
+            num_subcarriers,
+            dtype=torch.float32,
+            device=self.device
         )
 
         # Compute frequency response from impulse response
@@ -249,12 +251,12 @@ class SionnaCSIGenerator:
         h_freq_complex = self._impulse_to_frequency(h, tau, freq_grid)
 
         # Transpose to [batch, num_subcarriers, num_rx, num_tx]
-        h_freq = tf.transpose(h_freq_complex, [0, 3, 1, 2])
+        h_freq = torch.permute(h_freq_complex, (0, 3, 1, 2))
 
-        return h_freq.numpy()
+        return h_freq.cpu().numpy()
 
-    def _impulse_to_frequency(self, h: tf.Tensor, tau: tf.Tensor,
-                              freq_grid: tf.Tensor) -> tf.Tensor:
+    def _impulse_to_frequency(self, h: torch.Tensor, tau: torch.Tensor,
+                              freq_grid: torch.Tensor) -> torch.Tensor:
         """
         Convert channel impulse response to frequency response.
 
@@ -262,37 +264,37 @@ class SionnaCSIGenerator:
             h: Channel impulse response [batch, num_clusters, num_rx, num_tx]
             tau: Path delays [batch, num_clusters]
             freq_grid: Frequency grid [num_subcarriers]
-            batch_size: Batch size
 
         Returns:
             Frequency response [batch, num_subcarriers, num_rx, num_tx]
         """
         num_subcarriers = self.config.num_subcarriers
-        num_clusters = self.config.num_paths
+        # Get actual number of clusters from tau tensor shape
+        num_clusters = tau.shape[1]
 
         # Expand dimensions for broadcasting
         # freq_grid: [num_subcarriers] -> [num_subcarriers, 1, 1, 1]
         # tau: [batch, num_clusters] -> [1, num_clusters, 1, 1]
         # h: [batch, num_clusters, num_rx, num_tx]
 
-        freq_exp = tf.reshape(freq_grid, [num_subcarriers, 1, 1, 1])
-        tau_exp = tf.reshape(tau, [1, num_clusters, 1, 1])
-        h_exp = tf.expand_dims(h, 1)  # [batch, 1, num_clusters, num_rx, num_tx]
+        freq_exp = freq_grid.reshape(num_subcarriers, 1, 1, 1)
+        tau_exp = tau.reshape(1, num_clusters, 1, 1)
+        h_exp = h.unsqueeze(1)  # [batch, 1, num_clusters, num_rx, num_tx]
 
         # Compute phase shift for each path and frequency
         # exp(-j * 2 * pi * f * tau)
-        phase = tf.constant(-2 * np.pi, dtype=tf.float32)
-        phase_shift = tf.exp(phase * 1j * freq_exp * tf.cast(tau_exp, tf.complex64))
+        phase = torch.tensor(-2 * np.pi, dtype=torch.float32, device=self.device)
+        phase_shift = torch.exp(phase * 1j * freq_exp * tau_exp.to(torch.complex64))
 
         # Sum contributions from all clusters
         # h_exp: [batch, num_sc, num_clusters, num_rx, num_tx]
         # phase_shift: [num_sc, num_clusters, 1, 1]
-        h_expanded = tf.cast(h_exp, tf.complex64)
-        phase_shift = tf.cast(phase_shift, tf.complex64)
+        h_expanded = h_exp.to(torch.complex64)
+        phase_shift = phase_shift.to(torch.complex64)
 
-        h_freq = tf.reduce_sum(h_expanded * phase_shift, axis=2)
+        h_freq = torch.sum(h_expanded * phase_shift, dim=2)
 
-        return tf.transpose(h_freq, [0, 2, 3, 1])  # [batch, num_rx, num_tx, num_sc]
+        return torch.permute(h_freq, (0, 2, 3, 1))  # [batch, num_rx, num_tx, num_sc]
 
     def _generate_fdd_channels(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -323,13 +325,19 @@ class SionnaCSIGenerator:
         num_subcarriers = self.config.num_subcarriers
 
         # Create frequency grids for DL and UL
-        freq_grid_dl = tf.constant(
-            np.linspace(-num_subcarriers/2, num_subcarriers/2 - 1, num_subcarriers),
-            dtype=tf.float32
+        freq_grid_dl = torch.linspace(
+            -num_subcarriers / 2,
+            num_subcarriers / 2 - 1,
+            num_subcarriers,
+            dtype=torch.float32,
+            device=self.device
         )
-        freq_grid_ul = tf.constant(
-            np.linspace(-num_subcarriers/2, num_subcarriers/2 - 1, num_subcarriers),
-            dtype=tf.float32
+        freq_grid_ul = torch.linspace(
+            -num_subcarriers / 2,
+            num_subcarriers / 2 - 1,
+            num_subcarriers,
+            dtype=torch.float32,
+            device=self.device
         )
 
         # Compute frequency responses
@@ -337,13 +345,13 @@ class SionnaCSIGenerator:
         h_freq_ul_complex = self._impulse_to_frequency_fdd(h_ul, tau_dl, freq_grid_ul)  # Use same tau for correlation
 
         # Transpose to [batch, num_subcarriers, num_rx, num_tx]
-        h_freq_dl = tf.transpose(h_freq_dl_complex, [0, 3, 1, 2]).numpy()
-        h_freq_ul = tf.transpose(h_freq_ul_complex, [0, 3, 1, 2]).numpy()
+        h_freq_dl = torch.permute(h_freq_dl_complex, (0, 3, 1, 2)).cpu().numpy()
+        h_freq_ul = torch.permute(h_freq_ul_complex, (0, 3, 1, 2)).cpu().numpy()
 
         return h_freq_dl, h_freq_ul
 
-    def _impulse_to_frequency_fdd(self, h: tf.Tensor, tau: tf.Tensor,
-                                   freq_grid: tf.Tensor) -> tf.Tensor:
+    def _impulse_to_frequency_fdd(self, h: torch.Tensor, tau: torch.Tensor,
+                                   freq_grid: torch.Tensor) -> torch.Tensor:
         """
         Convert channel impulse response to frequency response for FDD.
 
@@ -356,24 +364,25 @@ class SionnaCSIGenerator:
             Frequency response [batch, num_subcarriers, num_rx, num_tx]
         """
         num_subcarriers = self.config.num_subcarriers
-        num_clusters = self.config.num_paths
+        # Get actual number of clusters from tau tensor shape
+        num_clusters = tau.shape[1]
 
         # Expand dimensions for broadcasting
-        freq_exp = tf.reshape(freq_grid, [num_subcarriers, 1, 1, 1])
-        tau_exp = tf.reshape(tau, [1, num_clusters, 1, 1])
-        h_exp = tf.expand_dims(h, 1)  # [batch, 1, num_clusters, num_rx, num_tx]
+        freq_exp = freq_grid.reshape(num_subcarriers, 1, 1, 1)
+        tau_exp = tau.reshape(1, num_clusters, 1, 1)
+        h_exp = h.unsqueeze(1)  # [batch, 1, num_clusters, num_rx, num_tx]
 
         # Compute phase shift for each path and frequency
-        phase = tf.constant(-2 * np.pi, dtype=tf.float32)
-        phase_shift = tf.exp(phase * 1j * freq_exp * tf.cast(tau_exp, tf.complex64))
+        phase = torch.tensor(-2 * np.pi, dtype=torch.float32, device=self.device)
+        phase_shift = torch.exp(phase * 1j * freq_exp * tau_exp.to(torch.complex64))
 
         # Sum contributions from all clusters
-        h_expanded = tf.cast(h_exp, tf.complex64)
-        phase_shift = tf.cast(phase_shift, tf.complex64)
+        h_expanded = h_exp.to(torch.complex64)
+        phase_shift = phase_shift.to(torch.complex64)
 
-        h_freq = tf.reduce_sum(h_expanded * phase_shift, axis=2)
+        h_freq = torch.sum(h_expanded * phase_shift, dim=2)
 
-        return tf.transpose(h_freq, [0, 2, 3, 1])  # [batch, num_rx, num_tx, num_sc]
+        return torch.permute(h_freq, (0, 2, 3, 1))  # [batch, num_rx, num_tx, num_sc]
 
     def _freq_to_csi_features(self, h_freq: np.ndarray) -> np.ndarray:
         """
