@@ -35,6 +35,7 @@ class ChannelConfig:
     # OFDM parameters
     num_subcarriers: int = 128
     ofdm_symbols_per_slot: int = 14
+    subcarrier_spacing: int = 15000
 
     # Channel model parameters
     num_paths: int = 20  # Number of multipath components (clusters)
@@ -90,29 +91,23 @@ class SionnaCSIGenerator:
         # Configure transmit antenna array (Base Station) using Panel Array
         # BS typically uses a large panel array with dual-polarization
         bs_array = AntennaArray(
-            antenna=Antenna(
-                polarization="dual",
-                polarization_type="cross",
-                antenna_pattern="38.901",  # 3GPP TR 38.901 antenna pattern
-                carrier_frequency=carrier_frequency
-            ),
+            polarization="dual",
+            polarization_type="cross",
+            antenna_pattern="38.901",  # 3GPP TR 38.901 antenna pattern
+            carrier_frequency=carrier_frequency,
             num_rows=self.config.num_tx_antennas // 8,
-            num_cols=8,
-            steering="spatial"
+            num_cols=8
         )
 
         # Configure receive antenna array (User Equipment)
         # UE typically uses smaller arrays (e.g., 4x4 for mobile devices)
         ue_array = AntennaArray(
-            antenna=Antenna(
-                polarization="dual",
-                polarization_type="cross",
-                antenna_pattern="38.901",
-                carrier_frequency=carrier_frequency
-            ),
+            polarization="dual",
+            polarization_type="cross",
+            antenna_pattern="38.901",
+            carrier_frequency=carrier_frequency,
             num_rows=4,
-            num_cols=4,
-            steering="spatial"
+            num_cols=4
         )
 
         return bs_array, ue_array
@@ -120,6 +115,19 @@ class SionnaCSIGenerator:
     def _setup_channel_model(self):
         """Initialize the Sionna 2.0 channel model using CDL."""
         from sionna.phy.channel.tr38901 import CDL
+        from sionna.phy.ofdm import ResourceGrid
+        
+        # config OFDM resource grid
+        self.ofdm_resource_grid = ResourceGrid(
+            num_ofdm_symbols=self.config.ofdm_symbols_per_slot,  # symbol number in one slot
+            fft_size=self.config.num_subcarriers,
+            subcarrier_spacing=self.config.subcarrier_spacing,
+            num_tx=self.config.num_tx_antennas,
+            num_streams_per_tx=self.config.num_rx_antennas,
+            cyclic_prefix_length=6,  # CP length
+            pilot_pattern="kronecker",  # pilot mode
+            pilot_ofdm_symbol_indices=[2, 11]  # pilot symbols
+        )
 
         if self.config.system_type.upper() == "FDD":
             # For FDD: create separate channel models for DL and UL
@@ -147,20 +155,18 @@ class SionnaCSIGenerator:
                 model=self.config.cdl_model,  # CDL model: A (LOS), B, C, D, E (NLOS)
                 delay_spread=self.config.delay_spread,
                 carrier_frequency=self.config.carrier_frequency,
-                array_bs=bs_array_dl,
-                array_ue=ue_array_dl,
-                direction="downlink",
-                dtype=torch.complex64
+                bs_array=bs_array_dl,
+                ut_array=ue_array_dl,
+                direction="downlink"
             )
 
             self.cdl_ul = CDL(
                 model=self.config.cdl_model,
                 delay_spread=self.config.delay_spread,
                 carrier_frequency=self.config.ul_carrier_frequency,
-                array_bs=bs_array_ul,
-                array_ue=ue_array_ul,
-                direction="uplink",
-                dtype=torch.complex64
+                bs_array=bs_array_ul,
+                ut_array=ue_array_ul,
+                direction="uplink"
             )
 
             self.cdl = None  # Not used in FDD mode
@@ -182,8 +188,7 @@ class SionnaCSIGenerator:
                 carrier_frequency=self.config.carrier_frequency,
                 array_bs=bs_array,
                 array_ue=ue_array,
-                direction="downlink",
-                dtype=torch.complex64
+                direction="downlink"
             )
 
             self.cdl_dl = self.cdl
@@ -313,11 +318,11 @@ class SionnaCSIGenerator:
             - h_freq_ul: [batch, num_subcarriers, num_rx, num_tx]
         """
         # Generate DL channel impulse response
-        h_dl, tau_dl = self.cdl_dl(batch_size=batch_size)
+        h_dl, tau_dl = self.cdl_dl(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
 
         # For UL, we use the same geometric parameters but generate a new realization
         # The CDL model will produce different channel coefficients for the UL frequency
-        h_ul, _ = self.cdl_ul(batch_size=batch_size)
+        h_ul, _ = self.cdl_ul(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
 
         # Reuse tau_dl for frequency response computation to maintain path correlation
         # This ensures both channels have the same multipath structure
@@ -363,26 +368,14 @@ class SionnaCSIGenerator:
         Returns:
             Frequency response [batch, num_subcarriers, num_rx, num_tx]
         """
-        num_subcarriers = self.config.num_subcarriers
-        # Get actual number of clusters from tau tensor shape
-        num_clusters = tau.shape[1]
 
-        # Expand dimensions for broadcasting
-        freq_exp = freq_grid.reshape(num_subcarriers, 1, 1, 1)
-        tau_exp = tau.reshape(1, num_clusters, 1, 1)
-        h_exp = h.unsqueeze(1)  # [batch, 1, num_clusters, num_rx, num_tx]
+        # transform to frequency CSI
+        # calculate frequency domain channel based on OFDM grid
+        from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
+        frequencies = subcarrier_frequencies(self.ofdm_resource_grid.fft_size, self.ofdm_resource_grid.subcarrier_spacing)
+        h_freq = cir_to_ofdm_channel(frequencies, h, tau, normalize=True)
 
-        # Compute phase shift for each path and frequency
-        phase = torch.tensor(-2 * np.pi, dtype=torch.float32, device=self.device)
-        phase_shift = torch.exp(phase * 1j * freq_exp * tau_exp.to(torch.complex64))
-
-        # Sum contributions from all clusters
-        h_expanded = h_exp.to(torch.complex64)
-        phase_shift = phase_shift.to(torch.complex64)
-
-        h_freq = torch.sum(h_expanded * phase_shift, dim=2)
-
-        return torch.permute(h_freq, (0, 2, 3, 1))  # [batch, num_rx, num_tx, num_sc]
+        return torch.permute(h_freq[:, 0, :, 0, :, :, :])  # [batch, num_rx, num_tx, num_sc]
 
     def _freq_to_csi_features(self, h_freq: np.ndarray) -> np.ndarray:
         """
