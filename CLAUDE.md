@@ -12,9 +12,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ┌─────────────────────────────────────────────────────────────────┐
 │                    CSI Feedback Pipeline                         │
 ├─────────────────────────────────────────────────────────────────┤
-│  Sionna (TF)          PyTorch                DeepSeek (Frozen)  │
-│  ─────────           ────────                ────────────────  │
-│  生成下行CSI  ──►  自定义Embedding  ──►   Transformer Block  │
+│  Sionna 2.0 (PyTorch)   PyTorch                DeepSeek (Frozen)│
+│  ──────────────────    ────────                ────────────────│
+│  生成下行CSI  ──►  自定义Embedding  ──►   Transformer Block   │
 │  信道数据         (2feat→hidden_dim)         (LoRA微调)       │
 │                        + 位置编码                               │
 │                                                    │             │
@@ -61,11 +61,20 @@ Output: [batch, seq_len, hidden_dim]
 - MSE Loss：预测的上行CSI vs 真实上行CSI
 
 ### Sionna数据生成
-- 基于TensorFlow，需转换为PyTorch张量
+- 基于Sionna 2.0 (PyTorch原生支持)
 - 信道特性：多径效应、衰落、MIMO传输
 - 支持TDD/FDD两种系统模式：
   - **TDD模式**: 基于信道互易性，上下行共享同一信道（添加微调扰动）
   - **FDD模式**: 上下行使用不同载波频率，分别独立生成，共享路径延迟以保持多径相关性
+
+### CSI数据维度
+- `cir_to_ofdm_channel`输出: `[batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers]`
+  - `num_rx/num_tx`: 空间流数量（本项目均为1）
+  - `num_rx_ant/num_tx_ant`: 天线元素数量（本项目分别为16和64）
+  - `num_ofdm_symbols`: OFDM符号数（本项目为14）
+- 经squeeze和OFDM符号平均后: `[batch, num_rx_ant, num_tx_ant, num_subcarriers]`
+- 经`_freq_to_csi_features`转换为: `[batch, num_subcarriers, num_rx_ant * num_tx_ant * 2]`
+- 最终输出: `[batch, seq_len, 2]`（通过`_reshape_to_seq`调整）
 
 ## 实际文件结构
 
@@ -79,7 +88,7 @@ DL_CSI_minimax/
 │   └── lora_utils.py              # LoRA配置工具
 ├── data/
 │   ├── __init__.py
-│   ├── sionna_csi_generator.py    # Sionna信道数据生成 (TensorFlow)
+│   ├── sionna_csi_generator.py    # Sionna信道数据生成 (PyTorch/Sionna 2.0)
 │   ├── data_converter.py          # TF → PyTorch 格式转换
 │   └── csi_dataset.py             # PyTorch Dataset
 ├── training/
@@ -100,7 +109,7 @@ DL_CSI_minimax/
 - torch>=2.0
 - transformers>=4.36.0 (DeepSeek)
 - peft>=0.7.0 (LoRA)
-- tensorflow>=2.12.0 + sionna (CSI数据生成)
+- sionna>=2.0 (CSI数据生成，PyTorch原生)
 - pyyaml, numpy, h5py
 
 ## 常用命令

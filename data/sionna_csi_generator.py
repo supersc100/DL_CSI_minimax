@@ -28,7 +28,8 @@ class ChannelConfig:
     # For FDD, typical uplink is lower (e.g., 2.1 GHz for 3.5 GHz downlink)
     ul_carrier_frequency: float = 2.1e9
 
-    # Number of transmit/receive antennas
+    # Number of transmit/receive antennas (these are total antenna elements, not spatial streams)
+    # For dual-polarization arrays: actual array size = num_tx_antennas / 2 per polarization
     num_tx_antennas: int = 64
     num_rx_antennas: int = 16
 
@@ -238,11 +239,8 @@ class SionnaCSIGenerator:
         # Output shapes depend on the channel model configuration
         h, tau = self.cdl(batch_size=batch_size)
 
-        # Convert to frequency response by summing over delays
-        # Shape: [batch, num_rx, num_tx, num_subcarriers]
+        # Create frequency grid (unused by cir_to_ofdm_channel but kept for API)
         num_subcarriers = self.config.num_subcarriers
-
-        # Create frequency grid
         freq_grid = torch.linspace(
             -num_subcarriers / 2,
             num_subcarriers / 2 - 1,
@@ -251,55 +249,43 @@ class SionnaCSIGenerator:
             device=self.device
         )
 
-        # Compute frequency response from impulse response
-        # H(f) = sum over paths: h_i * exp(-j*2*pi*f*tau_i)
-        h_freq_complex = self._impulse_to_frequency(h, tau, freq_grid)
-
-        # Transpose to [batch, num_subcarriers, num_rx, num_tx]
-        h_freq = torch.permute(h_freq_complex, (0, 3, 1, 2))
+        # Compute frequency response using cir_to_ofdm_channel
+        # Returns: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+        h_freq = self._impulse_to_frequency(h, tau, freq_grid)
 
         return h_freq.cpu().numpy()
 
     def _impulse_to_frequency(self, h: torch.Tensor, tau: torch.Tensor,
                               freq_grid: torch.Tensor) -> torch.Tensor:
         """
-        Convert channel impulse response to frequency response.
+        Convert channel impulse response to frequency response using cir_to_ofdm_channel.
 
         Args:
-            h: Channel impulse response [batch, num_clusters, num_rx, num_tx]
+            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
             tau: Path delays [batch, num_clusters]
-            freq_grid: Frequency grid [num_subcarriers]
+            freq_grid: Frequency grid [num_subcarriers] (unused, kept for API compatibility)
 
         Returns:
-            Frequency response [batch, num_subcarriers, num_rx, num_tx]
+            Frequency response [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+            Note: For TDD with num_time_steps=1, the output is averaged over OFDM symbols
         """
-        num_subcarriers = self.config.num_subcarriers
-        # Get actual number of clusters from tau tensor shape
-        num_clusters = tau.shape[1]
+        from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
 
-        # Expand dimensions for broadcasting
-        # freq_grid: [num_subcarriers] -> [num_subcarriers, 1, 1, 1]
-        # tau: [batch, num_clusters] -> [1, num_clusters, 1, 1]
-        # h: [batch, num_clusters, num_rx, num_tx]
+        # Get frequency grid from OFDM resource grid
+        frequencies = subcarrier_frequencies(self.ofdm_resource_grid.fft_size, self.ofdm_resource_grid.subcarrier_spacing)
 
-        freq_exp = freq_grid.reshape(num_subcarriers, 1, 1, 1)
-        tau_exp = tau.reshape(1, num_clusters, 1, 1)
-        h_exp = h.unsqueeze(1)  # [batch, 1, num_clusters, num_rx, num_tx]
+        # Convert to frequency response using Sionna's cir_to_ofdm_channel
+        # Output: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers]
+        h_freq = cir_to_ofdm_channel(frequencies, h, tau, normalize=True)
 
-        # Compute phase shift for each path and frequency
-        # exp(-j * 2 * pi * f * tau)
-        phase = torch.tensor(-2 * np.pi, dtype=torch.float32, device=self.device)
-        phase_shift = torch.exp(phase * 1j * freq_exp * tau_exp.to(torch.complex64))
+        # h_freq shape: [batch, 1, num_rx_ant, 1, num_tx_ant, num_ofdm_symbols, num_sc]
+        # Squeeze num_rx and num_tx (both are 1 in this project), then average over OFDM symbols
+        # Result: [batch, num_rx_ant, num_tx_ant, num_subcarriers]
+        h_freq = h_freq.squeeze(dim=1).squeeze(dim=2)  # [batch, num_rx_ant, num_tx_ant, num_ofdm_symbols, num_subcarriers]
+        h_freq = h_freq.mean(dim=-2)  # Average over OFDM symbols -> [batch, num_rx_ant, num_tx_ant, num_subcarriers]
 
-        # Sum contributions from all clusters
-        # h_exp: [batch, num_sc, num_clusters, num_rx, num_tx]
-        # phase_shift: [num_sc, num_clusters, 1, 1]
-        h_expanded = h_exp.to(torch.complex64)
-        phase_shift = phase_shift.to(torch.complex64)
-
-        h_freq = torch.sum(h_expanded * phase_shift, dim=2)
-
-        return torch.permute(h_freq, (0, 2, 3, 1))  # [batch, num_rx, num_tx, num_sc]
+        # Permute to [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+        return torch.permute(h_freq, (0, 3, 1, 2))
 
     def _generate_fdd_channels(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -314,8 +300,8 @@ class SionnaCSIGenerator:
 
         Returns:
             Tuple of (h_freq_dl, h_freq_ul), each of shape:
-            - h_freq_dl: [batch, num_subcarriers, num_rx, num_tx]
-            - h_freq_ul: [batch, num_subcarriers, num_rx, num_tx]
+            - h_freq_dl: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+            - h_freq_ul: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
         """
         # Generate DL channel impulse response
         h_dl, tau_dl = self.cdl_dl(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
@@ -327,17 +313,9 @@ class SionnaCSIGenerator:
         # Reuse tau_dl for frequency response computation to maintain path correlation
         # This ensures both channels have the same multipath structure
 
+        # Create dummy frequency grids (unused by _impulse_to_frequency_fdd but kept for API compatibility)
         num_subcarriers = self.config.num_subcarriers
-
-        # Create frequency grids for DL and UL
-        freq_grid_dl = torch.linspace(
-            -num_subcarriers / 2,
-            num_subcarriers / 2 - 1,
-            num_subcarriers,
-            dtype=torch.float32,
-            device=self.device
-        )
-        freq_grid_ul = torch.linspace(
+        freq_grid = torch.linspace(
             -num_subcarriers / 2,
             num_subcarriers / 2 - 1,
             num_subcarriers,
@@ -345,47 +323,52 @@ class SionnaCSIGenerator:
             device=self.device
         )
 
-        # Compute frequency responses
-        h_freq_dl_complex = self._impulse_to_frequency_fdd(h_dl, tau_dl, freq_grid_dl)
-        h_freq_ul_complex = self._impulse_to_frequency_fdd(h_ul, tau_dl, freq_grid_ul)  # Use same tau for correlation
+        # Compute frequency responses - _impulse_to_frequency_fdd already returns [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+        h_freq_dl = self._impulse_to_frequency_fdd(h_dl, tau_dl, freq_grid)
+        h_freq_ul = self._impulse_to_frequency_fdd(h_ul, tau_dl, freq_grid)  # Use same tau for correlation
 
-        # Transpose to [batch, num_subcarriers, num_rx, num_tx]
-        h_freq_dl = torch.permute(h_freq_dl_complex, (0, 3, 1, 2)).cpu().numpy()
-        h_freq_ul = torch.permute(h_freq_ul_complex, (0, 3, 1, 2)).cpu().numpy()
-
-        return h_freq_dl, h_freq_ul
+        return h_freq_dl.cpu().numpy(), h_freq_ul.cpu().numpy()
 
     def _impulse_to_frequency_fdd(self, h: torch.Tensor, tau: torch.Tensor,
                                    freq_grid: torch.Tensor) -> torch.Tensor:
         """
-        Convert channel impulse response to frequency response for FDD.
+        Convert channel impulse response to frequency response for FDD using cir_to_ofdm_channel.
 
         Args:
-            h: Channel impulse response [batch, num_clusters, num_rx, num_tx]
+            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
             tau: Path delays [batch, num_clusters]
-            freq_grid: Frequency grid [num_subcarriers]
+            freq_grid: Frequency grid [num_subcarriers] (unused, kept for API compatibility)
 
         Returns:
-            Frequency response [batch, num_subcarriers, num_rx, num_tx]
+            Frequency response [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+            Note: Output is averaged over OFDM symbols
         """
-
-        # transform to frequency CSI
-        # calculate frequency domain channel based on OFDM grid
         from sionna.phy.channel import cir_to_ofdm_channel, subcarrier_frequencies
+
+        # Get frequency grid from OFDM resource grid
         frequencies = subcarrier_frequencies(self.ofdm_resource_grid.fft_size, self.ofdm_resource_grid.subcarrier_spacing)
+
+        # Convert to frequency response using Sionna's cir_to_ofdm_channel
+        # Output: [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers]
         h_freq = cir_to_ofdm_channel(frequencies, h, tau, normalize=True)
 
-        return torch.permute(h_freq[:, 0, :, 0, :, :, :])  # [batch, num_rx, num_tx, num_sc]
+        # h_freq shape: [batch, 1, num_rx_ant, 1, num_tx_ant, num_ofdm_symbols, num_sc]
+        # Squeeze num_rx and num_tx (both are 1 in this project), then average over OFDM symbols
+        h_freq = h_freq.squeeze(dim=1).squeeze(dim=2)  # [batch, num_rx_ant, num_tx_ant, num_ofdm_symbols, num_subcarriers]
+        h_freq = h_freq.mean(dim=-2)  # Average over OFDM symbols -> [batch, num_rx_ant, num_tx_ant, num_subcarriers]
+
+        # Permute to [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+        return torch.permute(h_freq, (0, 3, 1, 2))
 
     def _freq_to_csi_features(self, h_freq: np.ndarray) -> np.ndarray:
         """
         Convert frequency response to feature format.
 
         Args:
-            h_freq: [batch, num_subcarriers, num_rx, num_tx]
+            h_freq: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
 
         Returns:
-            [batch, num_subcarriers, num_rx * num_tx * 2] (real + imag)
+            [batch, num_subcarriers, num_rx_ant * num_tx_ant * 2] (real + imag)
         """
         batch, num_sc, num_rx, num_tx = h_freq.shape
 
@@ -410,10 +393,10 @@ class SionnaCSIGenerator:
         - Noise and estimation errors
 
         Args:
-            h_freq: Downlink channel [batch, num_subcarriers, num_rx, num_tx]
+            h_freq: Downlink channel [batch, num_subcarriers, num_rx_ant, num_tx_ant]
 
         Returns:
-            Uplink channel [batch, num_subcarriers, num_rx * num_tx * 2]
+            Uplink channel [batch, num_subcarriers, num_rx_ant * num_tx_ant * 2]
         """
         # Transpose for reciprocity: [batch, subcarriers, num_tx, num_rx]
         h_ul = np.transpose(h_freq, (0, 1, 3, 2))
