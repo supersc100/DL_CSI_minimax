@@ -41,25 +41,25 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32,
+        default=16,
         help="Batch size for data generation",
     )
     parser.add_argument(
         "--num_subcarriers",
         type=int,
-        default=128,
+        default=64,
         help="Number of OFDM subcarriers",
     )
     parser.add_argument(
         "--num_tx",
         type=int,
-        default=64,
+        default=2,
         help="Number of transmit antennas",
     )
     parser.add_argument(
         "--num_rx",
         type=int,
-        default=16,
+        default=2,
         help="Number of receive antennas",
     )
     parser.add_argument(

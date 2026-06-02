@@ -30,11 +30,11 @@ class ChannelConfig:
 
     # Number of transmit/receive antennas (these are total antenna elements, not spatial streams)
     # For dual-polarization arrays: actual array size = num_tx_antennas / 2 per polarization
-    num_tx_antennas: int = 64
-    num_rx_antennas: int = 16
+    num_tx_antennas: int = 2
+    num_rx_antennas: int = 2
 
     # OFDM parameters
-    num_subcarriers: int = 128
+    num_subcarriers: int = 64
     ofdm_symbols_per_slot: int = 14
     subcarrier_spacing: int = 15000
 
@@ -47,7 +47,7 @@ class ChannelConfig:
     snr_db_max: float = 30.0
 
     # Training data parameters
-    batch_size: int = 32
+    batch_size: int = 16
     output_seq_len: int = 128  # Sequence length for CSI feedback
 
     # CDL model type: 'A' (LOS), 'B', 'C', 'D', 'E' (NLOS)
@@ -96,8 +96,8 @@ class SionnaCSIGenerator:
             polarization_type="cross",
             antenna_pattern="38.901",  # 3GPP TR 38.901 antenna pattern
             carrier_frequency=carrier_frequency,
-            num_rows=self.config.num_tx_antennas // 8,
-            num_cols=8
+            num_rows=1,
+            num_cols=self.config.num_tx_antennas // 2
         )
 
         # Configure receive antenna array (User Equipment)
@@ -107,8 +107,8 @@ class SionnaCSIGenerator:
             polarization_type="cross",
             antenna_pattern="38.901",
             carrier_frequency=carrier_frequency,
-            num_rows=4,
-            num_cols=4
+            num_rows=1,
+            num_cols=self.config.num_rx_antennas // 2
         )
 
         return bs_array, ue_array
@@ -123,7 +123,7 @@ class SionnaCSIGenerator:
             num_ofdm_symbols=self.config.ofdm_symbols_per_slot,  # symbol number in one slot
             fft_size=self.config.num_subcarriers,
             subcarrier_spacing=self.config.subcarrier_spacing,
-            num_tx=self.config.num_tx_antennas,
+            num_tx=1,
             num_streams_per_tx=self.config.num_rx_antennas,
             cyclic_prefix_length=6,  # CP length
             pilot_pattern="kronecker",  # pilot mode
@@ -413,30 +413,25 @@ class SionnaCSIGenerator:
         Reshape CSI to [batch, seq_len, 2] format.
 
         Args:
-            csi: [batch, num_subcarriers * num_antennas * 2]
+            csi: [batch, num_subcarriers, num_antennas * 2]
 
         Returns:
             [batch, seq_len, 2]
         """
-        batch, features = csi.shape
+        batch, num_sc, num_feat = csi.shape
         seq_len = self.config.output_seq_len
-
-        # If features > seq_len * 2, we need to reduce
-        # This can happen when num_subcarriers * num_antennas * 2 > seq_len
         total_features_needed = seq_len * 2
 
-        if features > total_features_needed:
-            # Reduce via averaging or truncation
-            # Take the first N features (e.g., dominant paths)
-            csi = csi[:, :total_features_needed]
-        elif features < total_features_needed:
-            # Pad with zeros
-            padding = np.zeros((batch, total_features_needed - features))
-            csi = np.concatenate([csi, padding], axis=1)
+        # Flatten to [batch, num_subcarriers * num_antennas * 2]
+        csi_flat = csi.reshape(batch, num_sc * num_feat)
 
-        # Reshape to [batch, seq_len, 2]
-        csi = csi.reshape(batch, seq_len, 2)
+        if csi_flat.shape[1] > total_features_needed:
+            csi_flat = csi_flat[:, :total_features_needed]
+        elif csi_flat.shape[1] < total_features_needed:
+            padding = np.zeros((batch, total_features_needed - csi_flat.shape[1]))
+            csi_flat = np.concatenate([csi_flat, padding], axis=1)
 
+        csi = csi_flat.reshape(batch, seq_len, 2)
         return csi
 
     def generate_dataset(
@@ -476,31 +471,26 @@ class SionnaCSIGenerator:
         return train_file, test_file
 
     def _generate_to_file(self, filepath: str, num_samples: int):
-        """Generate samples and save to HDF5 file."""
+        """Generate samples and save to HDF5 file incrementally."""
         samples_per_batch = self.config.batch_size
         num_batches = (num_samples + samples_per_batch - 1) // samples_per_batch
 
-        dl_csi_list = []
-        ul_csi_list = []
-
-        for i in range(num_batches):
-            current_batch = min(samples_per_batch, num_samples - i * samples_per_batch)
-            dl_csi, ul_csi = self.generate_channel_batch(batch_size=current_batch)
-            dl_csi_list.append(dl_csi)
-            ul_csi_list.append(ul_csi)
-
-            if (i + 1) % 10 == 0:
-                print(f"  Batch {i + 1}/{num_batches} complete")
-
-        dl_csi_all = np.concatenate(dl_csi_list, axis=0)[:num_samples]
-        ul_csi_all = np.concatenate(ul_csi_list, axis=0)[:num_samples]
-
         with h5py.File(filepath, 'w') as f:
-            f.create_dataset('dl_csi', data=dl_csi_all)
-            f.create_dataset('ul_csi', data=ul_csi_all)
+            dl_ds = f.create_dataset('dl_csi', (num_samples, self.config.output_seq_len, 2), dtype=np.float32)
+            ul_ds = f.create_dataset('ul_csi', (num_samples, self.config.output_seq_len, 2), dtype=np.float32)
+
+            for i in range(num_batches):
+                current_batch = min(samples_per_batch, num_samples - i * samples_per_batch)
+                dl_csi, ul_csi = self.generate_channel_batch(batch_size=current_batch)
+
+                start_idx = i * samples_per_batch
+                dl_ds[start_idx:start_idx + current_batch] = dl_csi
+                ul_ds[start_idx:start_idx + current_batch] = ul_csi
+
+                if (i + 1) % 10 == 0:
+                    print(f"  Batch {i + 1}/{num_batches} complete")
 
         print(f"  Saved to {filepath}")
-        print(f"  Shape: dl_csi={dl_csi_all.shape}, ul_csi={ul_csi_all.shape}")
 
 
 def generate_csi_dataset(
