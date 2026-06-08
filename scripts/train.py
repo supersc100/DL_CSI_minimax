@@ -24,7 +24,7 @@ from data.csi_dataset import create_csi_dataloaders
 
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     return config
 
@@ -37,7 +37,7 @@ def setup_model(config: dict, device: torch.device) -> nn.Module:
 
     # Get model configuration
     model_cfg = config.get('model', {})
-    model_path = model_cfg.get('deepseek_model_path', './models/deepseek-7b')
+    model_path = model_cfg.get('deepseek_model_path', './models/deepseek-1_5b')
 
     print(f"Loading DeepSeek model from: {model_path}")
 

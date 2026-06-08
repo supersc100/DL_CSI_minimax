@@ -64,6 +64,9 @@ class DeepSeekCSIModel(nn.Module):
 
         self.csi_embedding = CSIEmbedding(input_dim=2, hidden_dim=actual_hidden_dim, max_seq_len=max_seq_len)
         self.csi_regression = CSIRegressionHead(actual_hidden_dim)
+
+        # Keep embedding and regression in float32 for stable training
+        # Only convert to model dtype when passing to DeepSeek
         self._freeze_deepseek()
 
     def _load_deepseek_model(self, model_path: str, hidden_dim: int, use_flash_attention: bool):
@@ -71,8 +74,8 @@ class DeepSeekCSIModel(nn.Module):
         print(f"Loading DeepSeek model from: {model_path}")
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_path, trust_remote_code=True, torch_dtype=torch.float16,
-                attn_implementation="flash_attention_2" if use_flash_attention else "eager",
+                model_path, trust_remote_code=True, torch_dtype=torch.float32,
+                attn_implementation="eager",
             )
             print(f"  Model: {model.config.model_type}, Hidden: {model.config.hidden_size}")
             return model
@@ -81,26 +84,45 @@ class DeepSeekCSIModel(nn.Module):
             config = PretrainedConfig(model_type="llama", hidden_size=hidden_dim,
                                       intermediate_size=hidden_dim*4, num_hidden_layers=1,
                                       num_attention_heads=8, vocab_size=32000, max_position_embeddings=2048)
-            return AutoModelForCausalLM.from_config(config)
+            model = AutoModelForCausalLM.from_config(config)
+            # Fix: ensure model.model.layers exists and each layer returns proper output
+            if not hasattr(model.model, 'layers') or model.model.layers is None:
+                class MockLayer(nn.Module):
+                    def __init__(self, hidden_dim):
+                        super().__init__()
+                        self.hidden_dim = hidden_dim
+                    def forward(self, hidden_states, position_ids=None, **kwargs):
+                        # Simple pass-through with residual
+                        return hidden_states
+                model.model.layers = nn.ModuleList([MockLayer(hidden_dim)])
+            if not hasattr(model.model, 'norm') or model.model.norm is None:
+                model.model.norm = nn.Identity()
+            return model
 
     def _freeze_deepseek(self):
         for param in self.deepseek_model.parameters():
             param.requires_grad = False
 
-    def forward(self, csi_down: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
+        csi_down = input_ids
         batch_size, seq_len, _ = csi_down.shape
+
         hidden_states = self.csi_embedding(csi_down)
+        # print(f"After embedding: max={hidden_states.max():.4f}, min={hidden_states.min():.4f}, has_nan={torch.isnan(hidden_states).any()}")
+
+        # No dtype conversion needed - model is float32
         position_ids = torch.arange(seq_len, device=csi_down.device).unsqueeze(0).expand(batch_size, -1)
 
-        for layer in self.deepseek_model.model.layers:
-            layer_output = layer(hidden_states, position_ids=position_ids)
-            hidden_states = layer_output[0]
+        model_output = self.deepseek_model.model(
+            inputs_embeds=hidden_states,
+            position_ids=position_ids,
+        )
+        hidden_states = model_output[0]
+        # print(f"After Qwen2: max={hidden_states.max():.4f}, min={hidden_states.min():.4f}, has_nan={torch.isnan(hidden_states).any()}")
 
-        if hasattr(self.deepseek_model.model, 'norm'):
-            hidden_states = self.deepseek_model.model.norm(hidden_states)
-
-        return self.csi_regression(hidden_states)
-
+        output = self.csi_regression(hidden_states)
+        # print(f"After regression: max={output.max():.4f}, min={output.min():.4f}, has_nan={torch.isnan(output).any()}")
+        return output
     def print_trainable_parameters(self):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)

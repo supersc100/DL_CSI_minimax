@@ -2,7 +2,6 @@
 LoRA utilities for DeepSeek CSI model fine-tuning.
 """
 from peft import LoraConfig, get_peft_model, inject_adapter_in_model
-from peft.util import find_embedding_exportable_modules
 import torch
 import torch.nn as nn
 

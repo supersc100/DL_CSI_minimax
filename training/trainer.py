@@ -97,8 +97,8 @@ class CSITrainer:
                     other_params.append(param)
 
         param_groups = [
-            {"params": other_params, "lr": self.train_config.learning_rate * 0.1},
-            {"params": lora_params, "lr": self.train_config.learning_rate},
+            {"params": other_params, "lr": float(self.train_config.learning_rate) * 0.1},
+            {"params": lora_params, "lr": float(self.train_config.learning_rate)},
         ]
 
         return torch.optim.AdamW(
