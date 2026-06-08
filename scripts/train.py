@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.deepseek_csi_model import DeepSeekCSIModel
 from models.lora_utils import LoRAConfig, setup_lora
 from training.trainer import CSITrainer
-from data.csi_dataset import create_csi_dataloaders
+from data.csi_dataset import CSIDataLoader
 
 
 def load_config(config_path: str) -> dict:
@@ -39,7 +39,15 @@ def setup_model(config: dict, device: torch.device) -> nn.Module:
     model_cfg = config.get('model', {})
     model_path = model_cfg.get('deepseek_model_path', './models/deepseek-1_5b')
 
+    # Get environment configuration
+    env_cfg = config.get('environment', {})
+    use_env_info = env_cfg.get('enabled', False)
+    env_phase_dim = env_cfg.get('phase_dim', 20)
+    env_angles_dim = env_cfg.get('angles_delays_dim', 20)
+    env_cov_dim = env_cfg.get('cov_dim', 1024)
+
     print(f"Loading DeepSeek model from: {model_path}")
+    print(f"Environment info enabled: {use_env_info}")
 
     # Create CSI model
     model = DeepSeekCSIModel(
@@ -48,6 +56,10 @@ def setup_model(config: dict, device: torch.device) -> nn.Module:
         max_seq_len=model_cfg.get('max_seq_len', 1024),
         output_dim=2,
         use_flash_attention=model_cfg.get('use_flash_attention', False),
+        use_environment_info=use_env_info,
+        env_phase_dim=env_phase_dim,
+        env_angles_dim=env_angles_dim,
+        env_cov_dim=env_cov_dim,
     )
 
     # Move to device
@@ -134,11 +146,20 @@ def main():
     print("Loading CSI Data")
     print("=" * 60)
 
-    train_loader, test_loader = create_csi_dataloaders(
-        data_dir=args.data_dir,
+    # Get environment config
+    env_cfg = config.get('environment', {})
+    load_env_info = env_cfg.get('enabled', False)
+
+    from data.csi_dataset import CSIDataLoader
+    data_loader = CSIDataLoader(
+        train_file=f"{args.data_dir}/csi_data_train.h5",
+        test_file=f"{args.data_dir}/csi_data_test.h5",
         batch_size=config['training']['batch_size'],
         num_workers=config['training'].get('num_workers', 2),
+        load_env_info=load_env_info,
     )
+    train_loader = data_loader.train_loader
+    test_loader = data_loader.test_loader
 
     print(f"Training batches: {len(train_loader)}")
     print(f"Test batches: {len(test_loader)}")

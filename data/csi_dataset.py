@@ -21,21 +21,27 @@ class CSIDataset(Dataset):
         h5_file: str,
         transform: Optional[Callable] = None,
         normalize: bool = True,
+        load_env_info: bool = True,
     ):
         """
         Args:
             h5_file: Path to HDF5 file containing 'dl_csi' and 'ul_csi' datasets
             transform: Optional transform to apply to each sample
             normalize: Whether to normalize the CSI data
+            load_env_info: Whether to load environmental information (phases, angles, covariance)
         """
         self.h5_file = h5_file
         self.transform = transform
         self.normalize = normalize
+        self.load_env_info = load_env_info
 
         with h5py.File(h5_file, 'r') as f:
             self.num_samples = f['dl_csi'].shape[0]
             self.seq_len = f['dl_csi'].shape[1]
             self.num_features = f['dl_csi'].shape[2]
+
+            # Check if environmental info is available
+            self.has_env_info = 'env_phases' in f
 
             # Compute normalization statistics
             if normalize:
@@ -51,8 +57,8 @@ class CSIDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a single CSI sample pair."""
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Get a single CSI sample pair with optional environmental info."""
         with h5py.File(self.h5_file, 'r') as f:
             dl_csi = f['dl_csi'][idx]
             ul_csi = f['ul_csi'][idx]
@@ -71,7 +77,17 @@ class CSIDataset(Dataset):
             dl_csi = self.transform(dl_csi)
             ul_csi = self.transform(ul_csi)
 
-        return dl_csi, ul_csi
+        # Load environmental info if available and requested
+        env_info = None
+        if self.load_env_info and self.has_env_info:
+            with h5py.File(self.h5_file, 'r') as f:
+                env_info = {
+                    'phases': torch.from_numpy(f['env_phases'][idx]).float(),
+                    'angles_delays': torch.from_numpy(f['env_angles_delays'][idx]).float(),
+                    'covariance': torch.from_numpy(f['env_covariance'][idx]).float(),
+                }
+
+        return dl_csi, ul_csi, env_info
 
     def get_normalization_params(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return normalization parameters for later use."""
@@ -90,6 +106,7 @@ class CSIDataLoader:
         batch_size: int = 32,
         num_workers: int = 4,
         shuffle_train: bool = True,
+        load_env_info: bool = True,
     ):
         """
         Args:
@@ -98,16 +115,19 @@ class CSIDataLoader:
             batch_size: Batch size for DataLoader
             num_workers: Number of worker processes for data loading
             shuffle_train: Whether to shuffle training data
+            load_env_info: Whether to load environmental information
         """
-        self.train_dataset = CSIDataset(train_file)
+        self.train_dataset = CSIDataset(train_file, load_env_info=load_env_info)
         self.test_dataset = CSIDataset(
             test_file,
             normalize=True,
+            load_env_info=load_env_info,
         )
 
         # Use training normalization for test set
         self.test_dataset.mean = self.train_dataset.mean
         self.test_dataset.std = self.train_dataset.std
+        self.test_dataset.has_env_info = self.train_dataset.has_env_info
 
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -129,6 +149,11 @@ class CSIDataLoader:
     def normalization_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get normalization parameters from training set."""
         return self.train_dataset.mean, self.train_dataset.std
+
+    @property
+    def has_env_info(self) -> bool:
+        """Check if environmental info is available."""
+        return self.train_dataset.has_env_info
 
 
 def create_csi_dataloaders(

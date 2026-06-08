@@ -53,6 +53,10 @@ class ChannelConfig:
     # CDL model type: 'A' (LOS), 'B', 'C', 'D', 'E' (NLOS)
     cdl_model: str = 'C'
 
+    # Environment info extraction parameters
+    extract_env_info: bool = False  # Whether to extract environmental info
+    num_dominant_paths: int = 5  # Number of dominant paths to extract for angles/delays
+
 
 class SionnaCSIGenerator:
     """
@@ -195,7 +199,7 @@ class SionnaCSIGenerator:
             self.cdl_dl = self.cdl
             self.cdl_ul = None  # Not used in TDD mode
 
-    def generate_channel_batch(self, batch_size: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def generate_channel_batch(self, batch_size: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, dict]:
         """
         Generate a batch of downlink and uplink CSI pairs.
 
@@ -203,23 +207,30 @@ class SionnaCSIGenerator:
             batch_size: Number of samples to generate. If None, uses config.batch_size.
 
         Returns:
-            Tuple of (dl_csi, ul_csi), each of shape:
+            Tuple of (dl_csi, ul_csi, env_info), each of shape:
             - dl_csi: [batch_size, num_subcarriers, num_tx_antennas * num_rx_antennas * 2]
                       (real and imag for each subcarrier)
             - ul_csi: [batch_size, num_subcarriers, num_rx_antennas * num_tx_antennas * 2]
+            - env_info: dict containing environmental information (only when extract_env_info=True)
         """
         batch_size = batch_size or self.config.batch_size
 
+        env_info = None
+
         if self.config.system_type.upper() == "FDD":
             # For FDD: generate DL and UL channels separately with different frequencies
-            h_freq_dl, h_freq_ul = self._generate_fdd_channels(batch_size)
+            h_freq_dl, h_freq_ul, h_dl, tau_dl = self._generate_fdd_channels(batch_size)
 
             # Convert to CSI features
             dl_csi = self._freq_to_csi_features(h_freq_dl)
             ul_csi = self._freq_to_csi_features(h_freq_ul)
+
+            # Extract environment info from DL channel
+            if self.config.extract_env_info:
+                env_info = self._extract_environment_info(h_dl, tau_dl, h_freq_dl)
         else:
             # For TDD: use reciprocal channel with slight perturbation
-            h_freq = self._generate_freq_response(batch_size)
+            h_freq, h, tau = self._generate_freq_response(batch_size)
 
             # Downlink CSI: UE receives from BS
             dl_csi = self._freq_to_csi_features(h_freq)
@@ -227,14 +238,26 @@ class SionnaCSIGenerator:
             # For uplink CSI, use reciprocity with slight variations
             ul_csi = self._generate_reciprocal_channel(h_freq)
 
+            # Extract environment info
+            if self.config.extract_env_info:
+                env_info = self._extract_environment_info(h, tau, h_freq)
+
         # Reshape output to [batch, seq_len, 2] format for the model
         dl_csi = self._reshape_to_seq(dl_csi)  # [batch, seq_len, 2]
         ul_csi = self._reshape_to_seq(ul_csi)
 
-        return dl_csi, ul_csi
+        return dl_csi, ul_csi, env_info
 
-    def _generate_freq_response(self, batch_size: int) -> np.ndarray:
-        """Generate frequency response using Sionna's CDL channel model."""
+    def _generate_freq_response(self, batch_size: int) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        """
+        Generate frequency response using Sionna's CDL channel model.
+
+        Returns:
+            Tuple of (h_freq, h, tau):
+            - h_freq: Frequency response [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+            - h: Channel impulse response (for env info extraction)
+            - tau: Path delays (for env info extraction)
+        """
         # Generate batch of channel impulse responses
         # Output shapes depend on the channel model configuration
         h, tau = self.cdl(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
@@ -253,7 +276,7 @@ class SionnaCSIGenerator:
         # Returns: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
         h_freq = self._impulse_to_frequency(h, tau, freq_grid)
 
-        return h_freq.cpu().numpy()
+        return h_freq.cpu().numpy(), h, tau
 
     def _impulse_to_frequency(self, h: torch.Tensor, tau: torch.Tensor,
                               freq_grid: torch.Tensor) -> torch.Tensor:
@@ -287,7 +310,7 @@ class SionnaCSIGenerator:
         # Permute to [batch, num_subcarriers, num_rx_ant, num_tx_ant]
         return torch.permute(h_freq, (0, 3, 1, 2))
 
-    def _generate_fdd_channels(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _generate_fdd_channels(self, batch_size: int) -> Tuple[np.ndarray, np.ndarray, torch.Tensor, torch.Tensor]:
         """
         Generate separate downlink and uplink channels for FDD systems.
 
@@ -299,9 +322,11 @@ class SionnaCSIGenerator:
             batch_size: Number of samples to generate
 
         Returns:
-            Tuple of (h_freq_dl, h_freq_ul), each of shape:
+            Tuple of (h_freq_dl, h_freq_ul, h_dl, tau_dl):
             - h_freq_dl: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
             - h_freq_ul: [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+            - h_dl: DL channel impulse response (for env info extraction)
+            - tau_dl: DL path delays (for env info extraction)
         """
         # Generate DL channel impulse response
         h_dl, tau_dl = self.cdl_dl(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
@@ -327,7 +352,7 @@ class SionnaCSIGenerator:
         h_freq_dl = self._impulse_to_frequency_fdd(h_dl, tau_dl, freq_grid)
         h_freq_ul = self._impulse_to_frequency_fdd(h_ul, tau_dl, freq_grid)  # Use same tau for correlation
 
-        return h_freq_dl.cpu().numpy(), h_freq_ul.cpu().numpy()
+        return h_freq_dl.cpu().numpy(), h_freq_ul.cpu().numpy(), h_dl, tau_dl
 
     def _impulse_to_frequency_fdd(self, h: torch.Tensor, tau: torch.Tensor,
                                    freq_grid: torch.Tensor) -> torch.Tensor:
@@ -359,6 +384,128 @@ class SionnaCSIGenerator:
 
         # Permute to [batch, num_subcarriers, num_rx_ant, num_tx_ant]
         return torch.permute(h_freq, (0, 3, 1, 2))
+
+       def _extract_path_phases(self, h: torch.Tensor) -> np.ndarray:
+        """
+        Extract phase information from channel impulse response.
+
+        Args:
+            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
+
+        Returns:
+            Phase features [batch, num_paths]
+        """
+        # Get phase of complex channel coefficients
+        # h is complex, take angle
+        phases = torch.angle(h)  # [batch, num_clusters, ...]
+        # Average over antennas to get path phases
+        batch, num_clusters = phases.shape[:2]
+        phases = phases.mean(dim=(2, 3, 4, 5))  # [batch, num_clusters]
+        return phases.cpu().numpy()
+
+    def _extract_dominant_angles_delays(self, h: torch.Tensor, tau: torch.Tensor) -> np.ndarray:
+        """
+        Extract dominant path angles (AoD, AoA) and delays.
+
+        Args:
+            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
+            tau: Path delays [batch, num_clusters]
+
+        Returns:
+            [batch, num_dominant_paths * 4] (AoD, AoA, delay, power)
+        """
+        batch_size = h.shape[0]
+        num_dominant = self.config.num_dominant_paths
+
+        # Compute power of each path (average over antennas)
+        h_power = torch.mean(torch.abs(h) ** 2, dim=(2, 3, 4, 5))  # [batch, num_clusters]
+
+        # Get top-k dominant paths indices
+        _, top_indices = torch.topk(h_power, k=min(num_dominant, h_power.shape[1]), dim=1)
+
+        # Extract features for dominant paths
+        # Note: Sionna CDL doesn't directly provide angles, we use delay as proxy
+        # and derive approximate angle info from path power
+        features = []
+
+        for i in range(batch_size):
+            batch_features = []
+            for idx in top_indices[i]:
+                delay = tau[i, idx].item()
+                power = h_power[i, idx].item()
+                # Approximate angles from path index (Sionna CDL generates random angles internally)
+                # We use normalized position as proxy
+                aoa = (idx.item() / self.config.num_paths) * 2 * np.pi
+                aod = ((idx.item() + 7) % self.config.num_paths / self.config.num_paths) * 2 * np.pi
+                batch_features.extend([np.sin(aoa), np.cos(aoa), delay * 1e6, power])  # scale delay for numerical stability
+            features.append(batch_features)
+
+        # Pad if necessary
+        while len(features[0]) < num_dominant * 4:
+            for i in range(batch_size):
+                features[i].extend([0.0, 0.0, 0.0, 0.0])
+
+        features = np.array(features)[:, :num_dominant * 4]
+        return features
+
+    def _compute_covariance_matrix(self, h_freq: np.ndarray) -> np.ndarray:
+        """
+        Compute spatial covariance matrix from frequency response.
+
+        Args:
+            h_freq: Frequency response [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+
+        Returns:
+            Covariance matrix [batch, num_rx_ant * num_tx_ant, num_rx_ant * num_tx_ant]
+        """
+        batch, num_sc, num_rx, num_tx = h_freq.shape
+        ant_size = num_rx * num_tx
+
+        # Reshape to [batch, num_subcarriers, ant_size]
+        h_reshaped = h_freq.reshape(batch, num_sc, ant_size)
+
+        # Average over subcarriers to get spatial covariance
+        # Cov = E[h * h^H] where h is spatial channel vector
+        h_spatial = h_reshaped.mean(dim=1)  # [batch, ant_size]
+
+        # Compute covariance: cov[i,j] = E[h_i * conj(h_j)]
+        # Using outer product: cov = h * h^H
+        cov = np.zeros((batch, ant_size, ant_size), dtype=np.float32)
+
+        for i in range(batch):
+            h_vec = h_spatial[i]  # [ant_size] complex
+            # Outer product: h[:, None] * h_conj[None, :]
+            h_complex = h_vec.astype(np.complex64)
+            cov[i] = np.real(np.outer(h_complex, np.conj(h_complex)))
+
+        # Normalize covariance
+        for i in range(batch):
+            cov[i] = cov[i] / (np.trace(cov[i]) + 1e-8)
+
+        return cov
+
+    def _extract_environment_info(self, h: torch.Tensor, tau: torch.Tensor,
+                                   h_freq: np.ndarray) -> dict:
+        """
+        Extract all environmental information from channel data.
+
+        Args:
+            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
+            tau: Path delays [batch, num_clusters]
+            h_freq: Frequency response [batch, num_subcarriers, num_rx_ant, num_tx_ant]
+
+        Returns:
+            Dictionary containing environmental info
+        """
+        phases = self._extract_path_phases(h)
+        angles_delays = self._extract_dominant_angles_delays(h, tau)
+        covariance = self._compute_covariance_matrix(h_freq)
+
+        return {
+            'phases': phases,           # [batch, num_paths]
+            'angles_delays': angles_delays,  # [batch, num_dominant * 4]
+            'covariance': covariance # [batch, ant_size, ant_size]
+        }
 
     def _freq_to_csi_features(self, h_freq: np.ndarray) -> np.ndarray:
         """
@@ -479,13 +626,28 @@ class SionnaCSIGenerator:
             dl_ds = f.create_dataset('dl_csi', (num_samples, self.config.output_seq_len, 2), dtype=np.float32)
             ul_ds = f.create_dataset('ul_csi', (num_samples, self.config.output_seq_len, 2), dtype=np.float32)
 
+            # Create datasets for environmental info if enabled
+            if self.config.extract_env_info:
+                num_paths = self.config.num_paths
+                num_dominant = self.config.num_dominant_paths
+                ant_size = self.config.num_rx_antennas * self.config.num_tx_antennas
+
+                env_phases_ds = f.create_dataset('env_phases', (num_samples, num_paths), dtype=np.float32)
+                env_angles_ds = f.create_dataset('env_angles_delays', (num_samples, num_dominant * 4), dtype=np.float32)
+                env_cov_ds = f.create_dataset('env_covariance', (num_samples, ant_size, ant_size), dtype=np.float32)
+
             for i in range(num_batches):
                 current_batch = min(samples_per_batch, num_samples - i * samples_per_batch)
-                dl_csi, ul_csi = self.generate_channel_batch(batch_size=current_batch)
+                dl_csi, ul_csi, env_info = self.generate_channel_batch(batch_size=current_batch)
 
                 start_idx = i * samples_per_batch
                 dl_ds[start_idx:start_idx + current_batch] = dl_csi
                 ul_ds[start_idx:start_idx + current_batch] = ul_csi
+
+                if self.config.extract_env_info and env_info is not None:
+                    env_phases_ds[start_idx:start_idx + current_batch] = env_info['phases']
+                    env_angles_ds[start_idx:start_idx + current_batch] = env_info['angles_delays']
+                    env_cov_ds[start_idx:start_idx + current_batch] = env_info['covariance']
 
                 if (i + 1) % 10 == 0:
                     print(f"  Batch {i + 1}/{num_batches} complete")

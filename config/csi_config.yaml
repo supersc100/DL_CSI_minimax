@@ -18,9 +18,25 @@ data:
   # CSI data parameters
   seq_len: 128           # Sequence length for each CSI sample
   num_features: 2        # Real and imaginary parts
-  
+
   # Normalization
   normalize: true
+
+environment:
+  # Enable Phase 2: environmental info integration
+  enabled: false
+
+  # Number of dominant paths to extract for angles/delays
+  num_dominant_paths: 5
+
+  # Path phase dimension (from CDL num_paths)
+  phase_dim: 20
+
+  # Angles/delays dimension: num_dominant_paths * 4 (AoD, AoA, delay, power)
+  angles_delays_dim: 20
+
+  # Covariance matrix dimension: num_rx_ant * num_tx_ant
+  cov_dim: 1024  # 16 * 64 = 1024
 
 lora:
   # LoRA fine-tuning configuration

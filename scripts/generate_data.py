@@ -87,6 +87,17 @@ def main():
         default=2.1e9,
         help="Uplink carrier frequency in Hz (only used for FDD, default: 2.1 GHz)",
     )
+    parser.add_argument(
+        "--env_info",
+        action="store_true",
+        help="Extract and save environmental information (phases, angles, covariance)",
+    )
+    parser.add_argument(
+        "--num_dominant_paths",
+        type=int,
+        default=5,
+        help="Number of dominant paths to extract for angles/delays",
+    )
 
     args = parser.parse_args()
 
@@ -112,6 +123,8 @@ def main():
         output_seq_len=args.seq_len,
         carrier_frequency=args.dl_frequency,
         ul_carrier_frequency=args.ul_frequency,
+        extract_env_info=args.env_info,
+        num_dominant_paths=args.num_dominant_paths,
     )
 
     print("\nChannel Configuration:")
@@ -122,6 +135,9 @@ def main():
     print(f"  Number of paths: {config.num_paths}")
     print(f"  Delay spread: {config.delay_spread*1e9:.1f} ns")
     print(f"  SNR range: {config.snr_db_min}-{config.snr_db_max} dB")
+    print(f"  Extract env info: {config.extract_env_info}")
+    if config.extract_env_info:
+        print(f"  Num dominant paths: {config.num_dominant_paths}")
 
     # Generate dataset
     print("\nStarting data generation...")

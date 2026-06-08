@@ -145,13 +145,23 @@ class CSITrainer:
         total_loss = 0.0
         num_batches = 0
 
-        for batch_idx, (dl_csi, ul_csi) in enumerate(self.train_loader):
+        for batch_idx, batch_data in enumerate(self.train_loader):
+            # Handle both old format (dl_csi, ul_csi) and new format (dl_csi, ul_csi, env_info)
+            if len(batch_data) == 3:
+                dl_csi, ul_csi, env_info = batch_data
+            else:
+                dl_csi, ul_csi = batch_data
+                env_info = None
+
             # Move to device
             dl_csi = dl_csi.to(self.device)
             ul_csi = ul_csi.to(self.device)
+            if env_info is not None:
+                env_info = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                           for k, v in env_info.items()}
 
             # Forward pass
-            pred_ul_csi = self.model(dl_csi)
+            pred_ul_csi = self.model(dl_csi, env_info=env_info)
 
             # Compute loss
             loss = self.criterion(pred_ul_csi, ul_csi)
@@ -206,11 +216,21 @@ class CSITrainer:
         total_loss = 0.0
         num_batches = 0
 
-        for dl_csi, ul_csi in self.test_loader:
+        for batch_data in self.test_loader:
+            # Handle both old format (dl_csi, ul_csi) and new format (dl_csi, ul_csi, env_info)
+            if len(batch_data) == 3:
+                dl_csi, ul_csi, env_info = batch_data
+            else:
+                dl_csi, ul_csi = batch_data
+                env_info = None
+
             dl_csi = dl_csi.to(self.device)
             ul_csi = ul_csi.to(self.device)
+            if env_info is not None:
+                env_info = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                           for k, v in env_info.items()}
 
-            pred_ul_csi = self.model(dl_csi)
+            pred_ul_csi = self.model(dl_csi, env_info=env_info)
             loss = self.criterion(pred_ul_csi, ul_csi)
 
             total_loss += loss.item()

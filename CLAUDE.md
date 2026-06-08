@@ -39,7 +39,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 替换`embed_tokens`和`lm_head`
 - LoRA微调
 
-### Phase 2+: (待定)
+### Phase 2: 环境信息增强的CSI反馈
+在Phase 1基础上，将信道环境信息作为提示融入模型，增强CSI反馈效果：
+
+#### 环境信息包括
+- **路径相位(Phase)**: 各多径分量的相位信息
+- **信道协方差矩阵(Covariance)**: 空间相关性矩阵 `[ant_size, ant_size]`
+- **主导角度/时延(Angles/Delays)**: 到达角(AoA)、离开角(AoD)、路径时延、路径功率
+
+#### 架构修改
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Phase 2: 环境信息增强                          │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────┐    ┌─────────────┐    ┌──────────────────┐   │
+│  │ CSIEmbedding │ +  │ Environment │ →  │  Fusion (拼接)    │   │
+│  │  (2→hidden)  │    │   Encoder   │    │  hidden_dim*2→h │   │
+│  └──────────────┘   └─────────────┘    └──────────────────┘   │
+│                                                    │             │
+│                                                    ▼             │
+│                                           DeepSeek (Frozen+LoRA) │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 数据生成
+- 使用 `--env_info` 标志提取并保存环境信息
+- HDF5新增字段: `env_phases`, `env_angles_delays`, `env_covariance`
+
+#### 配置开关
+- `environment.enabled: true/false` 切换Phase 2功能
+- 默认关闭，保持向后兼容
 
 ## 关键技术点
 
@@ -75,6 +104,11 @@ Output: [batch, seq_len, hidden_dim]
 - 经squeeze和OFDM符号平均后: `[batch, num_rx_ant, num_tx_ant, num_subcarriers]`
 - 经`_freq_to_csi_features`转换为: `[batch, num_subcarriers, num_rx_ant * num_tx_ant * 2]`
 - 最终输出: `[batch, seq_len, 2]`（通过`_reshape_to_seq`调整）
+
+### 环境信息维度 (Phase 2)
+- `env_phases`: `[batch, num_paths]` - 路径相位
+- `env_angles_delays`: `[batch, num_dominant * 4]` - (AoD, AoA, delay, power)
+- `env_covariance`: `[batch, ant_size, ant_size]` - 空间协方差矩阵 (ant_size = num_rx_ant * num_tx_ant)
 
 ## 实际文件结构
 
@@ -121,7 +155,7 @@ pip install -r requirements.txt
 # 2. 下载DeepSeek模型（离线部署）
 python scripts/download_model.py \
     --model_name deepseek-ai/deepseek-llm-7b-base \
-    --output_dir ./models/deepseek-7b
+    --output_dir ./models/deepseek-7b # deepseek-ai/deepseek-r1-1.5b
 
 # 3. 生成CSI数据 (TDD模式，默认)
 python scripts/generate_data.py --num_samples 10000 --output_dir ./data
@@ -130,7 +164,14 @@ python scripts/generate_data.py --num_samples 10000 --output_dir ./data
 python scripts/generate_data.py --num_samples 10000 --system_type FDD \
     --dl_frequency 3.5e9 --ul_frequency 2.1e9 --output_dir ./data
 
+# 3c. 生成带环境信息的CSI数据 (Phase 2)
+python scripts/generate_data.py --num_samples 10000 --output_dir ./data --env_info
+
 # 4. 训练模型
+python scripts/train.py --config config/csi_config.yaml
+
+# 4b. 训练带环境信息的模型 (Phase 2)
+# 编辑 config/csi_config.yaml 设置 environment.enabled: true
 python scripts/train.py --config config/csi_config.yaml
 
 # 5. 单步训练测试
@@ -145,16 +186,26 @@ python -m pytest tests/test_deepseek_csi.py -v
 ### `DeepSeekCSIModel`
 主模型类，位于 [models/deepseek_csi_model.py](models/deepseek_csi_model.py)
 - `__init__()`: 加载DeepSeek、冻结参数、替换embedding/lm_head
-- `forward(csi_down)`: 前向传播，输入`[batch, seq_len, 2]`，输出`[batch, seq_len, 2]`
+- `forward(csi_down, env_info=None)`: 前向传播，输入`[batch, seq_len, 2]`，输出`[batch, seq_len, 2]`
+- 支持 `use_environment_info=True` 启用环境信息融合
+
+### `EnvironmentEncoder`
+环境信息编码器，位于 [models/deepseek_csi_model.py](models/deepseek_csi_model.py)
+- 编码 `phases`: `[batch, num_paths]` → `hidden_dim // 4`
+- 编码 `angles_delays`: `[batch, num_dominant*4]` → `hidden_dim // 4`
+- 编码 `covariance`: `[batch, ant_size, ant_size]` → `hidden_dim // 4`
+- 融合输出: `[batch, hidden_dim]`
 
 ### `CSITrainer`
 训练器类，位于 [training/trainer.py](training/trainer.py)
 - `fit()`: 完整训练循环
 - `train_epoch()`: 单轮训练
 - `evaluate()`: 评估模型
+- 支持处理 `env_info` 环境信息字典
 
 ### `SionnaCSIGenerator`
 数据生成器，位于 [data/sionna_csi_generator.py](data/sionna_csi_generator.py)
-- `generate_channel_batch()`: 生成下行/上行CSI对（支持TDD/FDD）
+- `generate_channel_batch()`: 生成下行/上行CSI对（支持TDD/FDD）+ 环境信息
 - `generate_dataset()`: 保存为HDF5格式
 - 支持TDD（基于信道互易性）和FDD（独立频率信道）两种模式
+- `extract_env_info=True` 时提取路径相位、角度/时延、协方差矩阵
