@@ -187,8 +187,8 @@ class SionnaCSIGenerator:
                 model=self.config.cdl_model,
                 delay_spread=self.config.delay_spread,
                 carrier_frequency=self.config.carrier_frequency,
-                array_bs=bs_array,
-                array_ue=ue_array,
+                bs_array=bs_array,
+                ut_array=ue_array,
                 direction="downlink"
             )
 
@@ -237,7 +237,7 @@ class SionnaCSIGenerator:
         """Generate frequency response using Sionna's CDL channel model."""
         # Generate batch of channel impulse responses
         # Output shapes depend on the channel model configuration
-        h, tau = self.cdl(batch_size=batch_size)
+        h, tau = self.cdl(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
 
         # Create frequency grid (unused by cir_to_ofdm_channel but kept for API)
         num_subcarriers = self.config.num_subcarriers
