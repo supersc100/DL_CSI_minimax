@@ -1,0 +1,39 @@
+data:
+  normalize: true
+  num_features: 2
+  seq_len: 128
+environment:
+  angles_delays_dim: 20
+  cov_dim: 1024
+  enabled: false
+  num_dominant_paths: 5
+  phase_dim: 20
+lora:
+  alpha: 16
+  dropout: 0.05
+  enabled: true
+  rank: 8
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+model:
+  hidden_dim: 1536
+  intermediate_size: 8960
+  max_seq_len: 2048
+  model_path: ./models/deepseek-1_5b
+  num_attention_heads: 12
+  num_hidden_layers: 28
+  use_flash_attention: false
+training:
+  batch_size: 1
+  epochs: 10
+  eval_every: 100
+  grad_clip: 1.0
+  learning_rate: 1e-5
+  log_every: 10
+  max_steps: 1
+  num_workers: 2
+  save_every: 500
+  weight_decay: 0.01

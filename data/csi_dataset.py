@@ -78,7 +78,7 @@ class CSIDataset(Dataset):
             ul_csi = self.transform(ul_csi)
 
         # Load environmental info if available and requested
-        env_info = None
+        env_info = {}
         if self.load_env_info and self.has_env_info:
             with h5py.File(self.h5_file, 'r') as f:
                 env_info = {

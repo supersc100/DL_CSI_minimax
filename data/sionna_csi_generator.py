@@ -385,7 +385,7 @@ class SionnaCSIGenerator:
         # Permute to [batch, num_subcarriers, num_rx_ant, num_tx_ant]
         return torch.permute(h_freq, (0, 3, 1, 2))
 
-       def _extract_path_phases(self, h: torch.Tensor) -> np.ndarray:
+    def _extract_path_phases(self, h: torch.Tensor) -> np.ndarray:
         """
         Extract phase information from channel impulse response.
 

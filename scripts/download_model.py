@@ -116,13 +116,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name",
         type=str,
-        default="deepseek-ai/deepseek-llm-7b-base",
+        default="deepseek-ai/deepseek-llm-7b-base", # DeepSeek-R1-Distill-Qwen-1.5B
         help="HuggingFace model name",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./models/deepseek-7b",
+        default="./models/deepseek-7b", # DeepSeek-R1-Distill-Qwen-1.5B
         help="Output directory for model",
     )
     parser.add_argument(

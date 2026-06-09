@@ -10,22 +10,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    CSI Feedback Pipeline                         │
+│                    CSI Feedback Pipeline                        │
 ├─────────────────────────────────────────────────────────────────┤
 │  Sionna 2.0 (PyTorch)   PyTorch                DeepSeek (Frozen)│
 │  ──────────────────    ────────                ────────────────│
-│  生成下行CSI  ──►  自定义Embedding  ──►   Transformer Block   │
-│  信道数据         (2feat→hidden_dim)         (LoRA微调)       │
+│  生成下行CSI  ──►  自定义Embedding  ──►   Transformer Block     │
+│  信道数据         (2feat→hidden_dim)         (LoRA微调)         │
 │                        + 位置编码                               │
-│                                                    │             │
-│                                                    ▼             │
+│                                                    │            │
+│                                                    ▼            │
 │                                           ┌──────────────┐      │
-│                                           │  Regression   │      │
-│                                           │  Head         │      │
-│                                           │  (seq_len×2)  │      │
+│                                           │  Regression  │      │
+│                                           │  Head        │      │
+│                                           │  (seq_len×2) │      │
 │                                           └──────────────┘      │
-│                                                    │             │
-│                                                    ▼             │
+│                                                    │            │
+│                                                    ▼            │
 │                                           预测上行CSI (MSE Loss) │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -50,15 +50,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 #### 架构修改
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Phase 2: 环境信息增强                          │
+│                    Phase 2: 环境信息增强                         │
 ├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐    ┌─────────────┐    ┌──────────────────┐   │
+│  ┌──────────────┐    ┌─────────────┐    ┌──────────────────┐    │
 │  │ CSIEmbedding │ +  │ Environment │ →  │  Fusion (拼接)    │   │
-│  │  (2→hidden)  │    │   Encoder   │    │  hidden_dim*2→h │   │
-│  └──────────────┘   └─────────────┘    └──────────────────┘   │
-│                                                    │             │
-│                                                    ▼             │
-│                                           DeepSeek (Frozen+LoRA) │
+│  │  (2→hidden)  │    │   Encoder   │    │  hidden_dim*2→h  │    │
+│  └──────────────┘    └─────────────┘    └──────────────────┘    │
+│                                                    │            │
+│                                                    ▼            │
+│                                           DeepSeek (Frozen+LoRA)│
 └─────────────────────────────────────────────────────────────────┘
 ```
 

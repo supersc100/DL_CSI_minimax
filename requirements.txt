@@ -1,17 +1,17 @@
 # Core PyTorch
-torch>=2.0.0
+torch>=2.11.0
 
 # DeepSeek / Transformers
-transformers>=4.36.0
+transformers>=5.5.4
 accelerate
 
 # LoRA
-peft>=0.7.0
+peft>=0.19.0
 
 # Sionna 2.0 for CSI data generation (PyTorch-based)
-sionna>=2.0
+sionna>=2.0.1
 
 # Utilities
-numpy>=1.24.0
+numpy>=2.4.4
 pyyaml
 h5py
