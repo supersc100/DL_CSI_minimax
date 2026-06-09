@@ -12,6 +12,7 @@ import torch.nn as nn
 from pathlib import Path
 import sys
 import os
+import logging
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -22,6 +23,31 @@ from training.trainer import CSITrainer
 from data.csi_dataset import CSIDataLoader
 
 
+def setup_logger(log_file: str) -> logging.Logger:
+    """Setup logger that outputs to both file and stdout."""
+    logger = logging.getLogger("train_script")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    # File handler
+    fh = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    fh.setLevel(logging.INFO)
+
+    # Console handler (stdout)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    return logger
+
+
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -29,11 +55,11 @@ def load_config(config_path: str) -> dict:
     return config
 
 
-def setup_model(config: dict, device: torch.device) -> nn.Module:
+def setup_model(config: dict, device: torch.device, logger: logging.Logger) -> nn.Module:
     """Initialize and set up the CSI model."""
-    print("=" * 60)
-    print("Setting up CSI Feedback Model")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Setting up CSI Feedback Model")
+    logger.info("=" * 60)
 
     # Get model configuration
     model_cfg = config.get('model', {})
@@ -46,8 +72,8 @@ def setup_model(config: dict, device: torch.device) -> nn.Module:
     env_angles_dim = env_cfg.get('angles_delays_dim', 20)
     env_cov_dim = env_cfg.get('cov_dim', 1024)
 
-    print(f"Loading DeepSeek model from: {model_path}")
-    print(f"Environment info enabled: {use_env_info}")
+    logger.info(f"Loading DeepSeek model from: {model_path}")
+    logger.info(f"Environment info enabled: {use_env_info}")
 
     # Create CSI model
     model = DeepSeekCSIModel(
@@ -68,7 +94,7 @@ def setup_model(config: dict, device: torch.device) -> nn.Module:
     # Setup LoRA
     lora_cfg = config.get('lora', {})
     if lora_cfg.get('enabled', True):
-        print("\nSetting up LoRA fine-tuning...")
+        logger.info("Setting up LoRA fine-tuning...")
         lora_config = LoRAConfig(
             r=lora_cfg.get('rank', 8),
             lora_alpha=lora_cfg.get('alpha', 16),
@@ -121,6 +147,13 @@ def main():
 
     args = parser.parse_args()
 
+    # Create output directory first for logging
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup logger
+    logger = setup_logger(str(output_dir / "training.log"))
+
     # Load configuration
     config = load_config(args.config)
 
@@ -132,19 +165,19 @@ def main():
 
     # Set device
     if args.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
+        logger.info("CUDA not available, falling back to CPU")
         args.device = "cpu"
 
     device = torch.device(args.device)
-    print(f"\nUsing device: {device}")
+    logger.info(f"\nUsing device: {device}")
 
     # Setup model
-    model = setup_model(config, device)
+    model = setup_model(config, device, logger)
 
     # Create data loaders
-    print("\n" + "=" * 60)
-    print("Loading CSI Data")
-    print("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info("Loading CSI Data")
+    logger.info("=" * 60)
 
     # Get environment config
     env_cfg = config.get('environment', {})
@@ -161,12 +194,8 @@ def main():
     train_loader = data_loader.train_loader
     test_loader = data_loader.test_loader
 
-    print(f"Training batches: {len(train_loader)}")
-    print(f"Test batches: {len(test_loader)}")
-
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Training batches: {len(train_loader)}")
+    logger.info(f"Test batches: {len(test_loader)}")
 
     # Save config
     with open(output_dir / "config.yaml", 'w') as f:
@@ -183,9 +212,9 @@ def main():
     )
 
     # Train
-    print("\n" + "=" * 60)
-    print("Starting Training")
-    print("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info("Starting Training")
+    logger.info("=" * 60)
 
     trainer.fit()
 

@@ -8,6 +8,33 @@ from pathlib import Path
 import time
 from dataclasses import dataclass
 from typing import Optional
+import logging
+import sys
+
+
+def setup_logger(name: str, log_file: str, level=logging.INFO) -> logging.Logger:
+    """Setup logger that outputs to both file and stdout."""
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers.clear()
+
+    # File handler
+    fh = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    fh.setLevel(level)
+
+    # Console handler (stdout)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    return logger
 
 
 @dataclass
@@ -55,6 +82,11 @@ class CSITrainer:
         self.config = config
         self.device = device
         self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Setup logger (both file and console)
+        log_file = self.output_dir / "training.log"
+        self.logger = setup_logger("csi_trainer", str(log_file))
 
         # Parse training config
         train_cfg = config.get('training', {})
@@ -115,8 +147,8 @@ class CSITrainer:
 
     def fit(self):
         """Run the full training loop."""
-        print(f"Starting training for {self.train_config.epochs} epochs")
-        print(f"Total training steps: {len(self.train_loader) * self.train_config.epochs}")
+        self.logger.info(f"Starting training for {self.train_config.epochs} epochs")
+        self.logger.info(f"Total training steps: {len(self.train_loader) * self.train_config.epochs}")
 
         for epoch in range(self.train_config.epochs):
             self.current_epoch = epoch
@@ -125,7 +157,7 @@ class CSITrainer:
             # Evaluate at end of epoch
             test_loss = self.evaluate()
 
-            print(
+            self.logger.info(
                 f"Epoch {epoch+1}/{self.train_config.epochs} | "
                 f"Train Loss: {train_loss:.6f} | Test Loss: {test_loss:.6f}"
             )
@@ -134,10 +166,10 @@ class CSITrainer:
             self.save_checkpoint(f"checkpoint_epoch_{epoch}.pt")
 
             if self.train_config.max_steps and self.global_step >= self.train_config.max_steps:
-                print(f"Reached max steps ({self.train_config.max_steps})")
+                self.logger.info(f"Reached max steps ({self.train_config.max_steps})")
                 break
 
-        print("\nTraining complete!")
+        self.logger.info("Training complete!")
 
     def train_epoch(self) -> float:
         """Run one training epoch."""
@@ -160,11 +192,30 @@ class CSITrainer:
                 env_info = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                            for k, v in env_info.items()}
 
+            # Debug: check input data
+            # if batch_idx % self.train_config.log_every == 0:
+            #     print(f"  Input dl_csi: max={dl_csi.max():.4f}, min={dl_csi.min():.4f}, dtype={dl_csi.dtype}")
+            #     print(f"  Input ul_csi: max={ul_csi.max():.4f}, min={ul_csi.min():.4f}, dtype={ul_csi.dtype}")
+            #     if env_info:
+            #         print(f"  Env phases: max={env_info['phases'].max():.4f}, min={env_info['phases'].min():.4f}")
+
             # Forward pass
             pred_ul_csi = self.model(dl_csi, env_info=env_info)
 
+            # Check for NaN in prediction
+            # if torch.isnan(pred_ul_csi).any() or torch.isinf(pred_ul_csi).any():
+            #     print(f"  WARNING: pred has NaN/Inf! Shape: {pred_ul_csi.shape}, max: {pred_ul_csi.max():.4f}, min: {pred_ul_csi.min():.4f}")
+            #     print(f"  dl_csi stats: max={dl_csi.max():.4f}, min={dl_csi.min():.4f}")
+            #     continue # Skip this batch
+
             # Compute loss
             loss = self.criterion(pred_ul_csi, ul_csi)
+            # print(f"Loss: {loss.item()}, pred has NaN: {torch.isnan(pred_ul_csi).any()}, target has NaN: {torch.isnan(ul_csi).any()}")
+            # # Check for NaN in loss
+            # if torch.isnan(loss) or torch.isinf(loss):
+            #     print(f"  WARNING: Loss is NaN/Inf! pred max={pred_ul_csi.max():.4f}, min={pred_ul_csi.min():.4f}")
+            #     print(f"  ul_csi stats: max={ul_csi.max():.4f}, min={ul_csi.min():.4f}")
+            #     continue  # Skip this batch
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -187,7 +238,7 @@ class CSITrainer:
             # Logging
             if batch_idx % self.train_config.log_every == 0:
                 lr = self.scheduler.get_last_lr()[0]
-                print(
+                self.logger.info(
                     f"  Step {self.global_step} | "
                     f"Loss: {loss.item():.6f} | "
                     f"LR: {lr:.2e}"
@@ -197,7 +248,7 @@ class CSITrainer:
             if self.global_step % self.train_config.eval_every == 0:
                 test_loss = self.evaluate()
                 self.model.train()
-                print(f"  [Eval] Test Loss: {test_loss:.6f}")
+                self.logger.info(f"  [Eval] Test Loss: {test_loss:.6f}")
 
             # Save checkpoint
             if self.global_step % self.train_config.save_every == 0:
@@ -251,7 +302,7 @@ class CSITrainer:
 
         path = self.output_dir / filename
         torch.save(checkpoint, path)
-        print(f"  Saved checkpoint: {path}")
+        self.logger.info(f"  Saved checkpoint: {path}")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
@@ -263,4 +314,4 @@ class CSITrainer:
         self.global_step = checkpoint["global_step"]
         self.current_epoch = checkpoint["epoch"]
 
-        print(f"Loaded checkpoint from {path}")
+        self.logger.info(f"Loaded checkpoint from {path}")
