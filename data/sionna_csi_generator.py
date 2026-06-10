@@ -390,17 +390,16 @@ class SionnaCSIGenerator:
         Extract phase information from channel impulse response.
 
         Args:
-            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
+            h: Channel impulse response [batch, 1, num_rx_ant, 1, num_tx_ant, num_paths, num_time_steps]
 
         Returns:
             Phase features [batch, num_paths]
         """
-        # Get phase of complex channel coefficients
-        # h is complex, take angle
-        phases = torch.angle(h)  # [batch, num_clusters, ...]
-        # Average over antennas to get path phases
-        batch, num_clusters = phases.shape[:2]
-        phases = phases.mean(dim=(2, 3, 4, 5))  # [batch, num_clusters]
+        # h shape: [batch, 1, num_rx_ant, 1, num_tx_ant, num_paths, num_time_steps]
+        # Average over antennas and time to get path phases
+        phases = torch.angle(h)  # still complex
+        phases = phases.mean(dim=(2, 4, 6))  # [batch, 1, 1, num_paths]
+        phases = phases.squeeze(dim=1).squeeze(dim=1)  # [batch, num_paths]
         return phases.cpu().numpy()
 
     def _extract_dominant_angles_delays(self, h: torch.Tensor, tau: torch.Tensor) -> np.ndarray:
@@ -408,36 +407,34 @@ class SionnaCSIGenerator:
         Extract dominant path angles (AoD, AoA) and delays.
 
         Args:
-            h: Channel impulse response [batch, num_clusters, num_rx, num_rx_ant, num_tx, num_tx_ant]
-            tau: Path delays [batch, num_clusters]
+            h: Channel impulse response [batch, 1, num_rx_ant, 1, num_tx_ant, num_paths, num_time_steps]
+            tau: Path delays [batch, 1, 1, num_paths]
 
         Returns:
             [batch, num_dominant_paths * 4] (AoD, AoA, delay, power)
         """
         batch_size = h.shape[0]
         num_dominant = self.config.num_dominant_paths
+        num_paths = h.shape[5]  # actual num_paths from CDL output
 
-        # Compute power of each path (average over antennas)
-        h_power = torch.mean(torch.abs(h) ** 2, dim=(2, 3, 4, 5))  # [batch, num_clusters]
+        # Compute power of each path (average over antennas and time)
+        h_power = torch.mean(torch.abs(h) ** 2, dim=(2, 4, 6))  # [batch, 1, 1, num_paths]
+        h_power = h_power.squeeze(dim=1).squeeze(dim=1)  # [batch, num_paths]
 
         # Get top-k dominant paths indices
-        _, top_indices = torch.topk(h_power, k=min(num_dominant, h_power.shape[1]), dim=1)
+        k = min(num_dominant, num_paths)
+        _, top_indices = torch.topk(h_power, k=k, dim=1)  # [batch, k]
 
-        # Extract features for dominant paths
-        # Note: Sionna CDL doesn't directly provide angles, we use delay as proxy
-        # and derive approximate angle info from path power
         features = []
-
         for i in range(batch_size):
             batch_features = []
-            for idx in top_indices[i]:
-                delay = tau[i, idx].item()
-                power = h_power[i, idx].item()
-                # Approximate angles from path index (Sionna CDL generates random angles internally)
-                # We use normalized position as proxy
-                aoa = (idx.item() / self.config.num_paths) * 2 * np.pi
-                aod = ((idx.item() + 7) % self.config.num_paths / self.config.num_paths) * 2 * np.pi
-                batch_features.extend([np.sin(aoa), np.cos(aoa), delay * 1e6, power])  # scale delay for numerical stability
+            for j in range(k):
+                idx_int = top_indices[i, j].item()  # Python int, no advanced indexing
+                delay = tau[i, 0, 0, idx_int].item()  # tau: [batch, 1, 1, num_paths]
+                power = h_power[i, idx_int].item()
+                aoa = (idx_int / num_paths) * 2 * np.pi
+                aod = ((idx_int + 7) % num_paths / num_paths) * 2 * np.pi
+                batch_features.extend([np.sin(aoa), np.cos(aoa), delay * 1e6, power])
             features.append(batch_features)
 
         # Pad if necessary
@@ -466,7 +463,7 @@ class SionnaCSIGenerator:
 
         # Average over subcarriers to get spatial covariance
         # Cov = E[h * h^H] where h is spatial channel vector
-        h_spatial = h_reshaped.mean(dim=1)  # [batch, ant_size]
+        h_spatial = h_reshaped.mean(axis=1)  # [batch, ant_size]
 
         # Compute covariance: cov[i,j] = E[h_i * conj(h_j)]
         # Using outer product: cov = h * h^H
@@ -498,6 +495,8 @@ class SionnaCSIGenerator:
             Dictionary containing environmental info
         """
         phases = self._extract_path_phases(h)
+        # Clip to configured num_paths (CDL may produce more paths than config.num_paths)
+        phases = phases[:, :self.config.num_paths]
         angles_delays = self._extract_dominant_angles_delays(h, tau)
         covariance = self._compute_covariance_matrix(h_freq)
 
