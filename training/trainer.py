@@ -7,9 +7,26 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 import logging
 import sys
+
+
+def nmse_db(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Normalized Mean Square Error in dB.
+
+    Args:
+        pred: Predicted CSI [batch, seq_len, 2] (real, imag)
+        target: Target CSI [batch, seq_len, 2] (real, imag)
+
+    Returns:
+        NMSE in dB (lower is better)
+    """
+    mse = torch.sum((pred - target) ** 2)
+    norm = torch.sum(target ** 2)
+    nmse_linear = mse / (norm + 1e-10)
+    return 10 * torch.log10(nmse_linear + 1e-10)
 
 
 def setup_logger(name: str, log_file: str, level=logging.INFO) -> logging.Logger:
@@ -155,11 +172,11 @@ class CSITrainer:
             train_loss = self.train_epoch()
 
             # Evaluate at end of epoch
-            test_loss = self.evaluate()
+            test_mse, test_nmse_db = self.evaluate()
 
             self.logger.info(
                 f"Epoch {epoch+1}/{self.train_config.epochs} | "
-                f"Train Loss: {train_loss:.6f} | Test Loss: {test_loss:.6f}"
+                f"Train Loss: {train_loss:.6f} | Test MSE: {test_mse:.6f} | Test NMSE: {test_nmse_db:.2f} dB"
             )
 
             # Save checkpoint
@@ -246,9 +263,9 @@ class CSITrainer:
 
             # Evaluation
             if self.global_step % self.train_config.eval_every == 0:
-                test_loss = self.evaluate()
+                test_mse, test_nmse_db = self.evaluate()
                 self.model.train()
-                self.logger.info(f"  [Eval] Test Loss: {test_loss:.6f}")
+                self.logger.info(f"  [Eval] Test MSE: {test_mse:.6f} | Test NMSE: {test_nmse_db:.2f} dB")
 
             # Save checkpoint
             if self.global_step % self.train_config.save_every == 0:
@@ -261,10 +278,16 @@ class CSITrainer:
         return total_loss / num_batches
 
     @torch.no_grad()
-    def evaluate(self) -> float:
-        """Evaluate the model on test set."""
+    def evaluate(self) -> Tuple[float, float]:
+        """
+        Evaluate the model on test set.
+
+        Returns:
+            Tuple of (mse_loss, nmse_db)
+        """
         self.model.eval()
-        total_loss = 0.0
+        total_mse = 0.0
+        total_nmse_db = 0.0
         num_batches = 0
 
         for batch_data in self.test_loader:
@@ -283,11 +306,13 @@ class CSITrainer:
 
             pred_ul_csi = self.model(dl_csi, env_info=env_info)
             loss = self.criterion(pred_ul_csi, ul_csi)
+            nmse = nmse_db(pred_ul_csi, ul_csi)
 
-            total_loss += loss.item()
+            total_mse += loss.item()
+            total_nmse_db += nmse.item()
             num_batches += 1
 
-        return total_loss / num_batches
+        return total_mse / num_batches, total_nmse_db / num_batches
 
     def save_checkpoint(self, filename: str):
         """Save model checkpoint."""
