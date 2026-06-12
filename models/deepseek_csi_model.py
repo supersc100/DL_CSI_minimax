@@ -15,6 +15,8 @@ class CSIEmbedding(nn.Module):
         self.hidden_dim = hidden_dim
         self.proj = nn.Linear(input_dim, hidden_dim)
         self.position_encoder = PositionalEncoding(hidden_dim, max_seq_len)
+        # Fusion layer to project concatenated [CSI; env] back to hidden_dim
+        self.env_fusion = nn.Linear(hidden_dim * 2, hidden_dim)
 
     def forward(self, x: torch.Tensor, env_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.proj(x)
@@ -22,7 +24,8 @@ class CSIEmbedding(nn.Module):
             seq_len = x.shape[1]
             # Broadcast env_features to match sequence length
             env_emb = env_features.unsqueeze(1).expand(-1, seq_len, -1)
-            x = torch.cat([x, env_emb], dim=-1)
+            x = torch.cat([x, env_emb], dim=-1)  # [batch, seq_len, hidden_dim * 2]
+            x = self.env_fusion(x)  # [batch, seq_len, hidden_dim]
             x = self.position_encoder(x)
         else:
             x = self.position_encoder(x)
@@ -82,14 +85,20 @@ class EnvironmentEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 4, hidden_dim // 4)
         )
-        # Covariance encoder: ant_size^2 -> hidden_dim // 4
-        self.cov_encoder = nn.Sequential(
-            nn.Linear(cov_dim, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, hidden_dim // 4)
-        )
+        # Covariance encoder: lazily created on first forward to match actual ant_size^2
+        self.cov_encoder = None
+        self._cov_dim = cov_dim      # fallback hint, not strictly used
+        self._hidden_dim = hidden_dim
         # Combined projection: 3 * (hidden_dim // 4) -> hidden_dim
         self.fusion = nn.Linear(hidden_dim // 4 * 3, hidden_dim)
+
+    def _build_cov_encoder(self, actual_cov_dim: int, device: torch.device, dtype: torch.dtype):
+        """Create cov_encoder matching the actual flattened covariance dimension."""
+        self.cov_encoder = nn.Sequential(
+            nn.Linear(actual_cov_dim, self._hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(self._hidden_dim // 4, self._hidden_dim // 4)
+        ).to(device=device, dtype=dtype)
 
     def forward(self, env_dict: dict) -> torch.Tensor:
         """
@@ -109,6 +118,12 @@ class EnvironmentEncoder(nn.Module):
         if cov.dim() == 3:
             batch = cov.shape[0]
             cov = cov.reshape(batch, -1)  # [batch, ant_size * ant_size]
+
+        # Lazily build cov_encoder to match actual covariance dimension
+        actual_cov_dim = cov.shape[-1]
+        if self.cov_encoder is None or self.cov_encoder[0].in_features != actual_cov_dim:
+            self._build_cov_encoder(actual_cov_dim, cov.device, cov.dtype)
+
         cov_feat = self.cov_encoder(cov)
 
         combined = torch.cat([phase_feat, angle_feat, cov_feat], dim=-1)
@@ -234,6 +249,9 @@ class DeepSeekCSIModel(nn.Module):
         # Encode environmental info if available and enabled
         env_features = None
         if self.use_environment_info and env_info is not None and self.env_encoder is not None:
+            # Convert env_info tensors to bfloat16 to match env_encoder dtype
+            env_info = {k: v.to(torch.bfloat16) if isinstance(v, torch.Tensor) else v
+                        for k, v in env_info.items()}
             env_features = self.env_encoder(env_info)  # [batch, hidden_dim]
             env_features = env_features.to(csi_down.device, torch.bfloat16)
             # assert env_features.dtype == torch.bfloat16, f"env_features dtype: {env_features.dtype}"

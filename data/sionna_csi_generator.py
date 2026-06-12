@@ -30,11 +30,11 @@ class ChannelConfig:
 
     # Number of transmit/receive antennas (these are total antenna elements, not spatial streams)
     # For dual-polarization arrays: actual array size = num_tx_antennas / 2 per polarization
-    num_tx_antennas: int = 2
-    num_rx_antennas: int = 2
+    num_tx_antennas: int = 16
+    num_rx_antennas: int = 4
 
     # OFDM parameters
-    num_subcarriers: int = 64
+    num_subcarriers: int = 128
     ofdm_symbols_per_slot: int = 14
     subcarrier_spacing: int = 15000
 
@@ -75,6 +75,8 @@ class SionnaCSIGenerator:
         self._check_sionna_available()
         self._setup_channel_model()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Counter for generating different seeds per batch in FDD mode
+        self.batch_index = 0
 
     def _check_sionna_available(self):
         """Verify Sionna is installed."""
@@ -156,6 +158,11 @@ class SionnaCSIGenerator:
 
             # Create CDL channel models
             # Direction is specified in constructor
+            # Use the SAME seed for both CDL constructors to ensure
+            # identical large-scale parameters (delays, angles, powers).
+            # Small-scale fading independence is handled in __call__.
+            from sionna.phy import config
+            config.seed = 42
             self.cdl_dl = CDL(
                 model=self.config.cdl_model,  # CDL model: A (LOS), B, C, D, E (NLOS)
                 delay_spread=self.config.delay_spread,
@@ -164,7 +171,6 @@ class SionnaCSIGenerator:
                 ut_array=ue_array_dl,
                 direction="downlink"
             )
-
             self.cdl_ul = CDL(
                 model=self.config.cdl_model,
                 delay_spread=self.config.delay_spread,
@@ -219,7 +225,7 @@ class SionnaCSIGenerator:
 
         if self.config.system_type.upper() == "FDD":
             # For FDD: generate DL and UL channels separately with different frequencies
-            h_freq_dl, h_freq_ul, h_dl, tau_dl = self._generate_fdd_channels(batch_size)
+            h_freq_dl, h_freq_ul, h_dl, tau_dl, h_ul, tau_ul = self._generate_fdd_channels(batch_size)
 
             # Convert to CSI features
             dl_csi = self._freq_to_csi_features(h_freq_dl)
@@ -228,6 +234,23 @@ class SionnaCSIGenerator:
             # Extract environment info from DL channel
             if self.config.extract_env_info:
                 env_info = self._extract_environment_info(h_dl, tau_dl, h_freq_dl)
+                env_info_ul = self._extract_environment_info(h_ul, tau_dl, h_freq_ul)
+
+                # Debug: Compare DL and UL covariance eigenvalues
+                print(f"\n[DEBUG FDD] DL vs UL Covariance Eigenvalue Comparison:")
+                dl_eig = env_info['cov_eigenvalues'][0]  # First sample
+                ul_eig = env_info_ul['cov_eigenvalues'][0]
+                print(f"  DL eigenvalues (top10): {dl_eig[:10]}")
+                print(f"  UL eigenvalues (top10): {ul_eig[:10]}")
+                print(f"  DL eigenvalue sum: {dl_eig.sum():.4f}")
+                print(f"  UL eigenvalue sum: {ul_eig.sum():.4f}")
+                print(f"  UL/DL eigenvalue ratio (sum): {ul_eig.sum() / dl_eig.sum():.4f}")
+                # Normalized eigenvalue ratios
+                dl_ratio = dl_eig / (dl_eig.sum() + 1e-10)
+                ul_ratio = ul_eig / (ul_eig.sum() + 1e-10)
+                print(f"  DL eigenvalue ratios (top5): {dl_ratio[:5]}")
+                print(f"  UL eigenvalue ratios (top5): {ul_ratio[:5]}")
+                print(f"  Ratio of ratios (DL vs UL): {np.abs(dl_ratio[:5] / (ul_ratio[:5] + 1e-10))}")
         else:
             # For TDD: use reciprocal channel with slight perturbation
             h_freq, h, tau = self._generate_freq_response(batch_size)
@@ -328,12 +351,28 @@ class SionnaCSIGenerator:
             - h_dl: DL channel impulse response (for env info extraction)
             - tau_dl: DL path delays (for env info extraction)
         """
+        # Use different seeds for DL and UL to ensure independent small-scale fading.
+        # Large-scale parameters (delays, angles, powers) are already identical
+        # because both CDL objects were constructed with the same seed.
+        base_seed = 42
+        dl_seed = base_seed + self.batch_index * 2
+        ul_seed = base_seed + self.batch_index * 2 + 1
+
+        # Set seed for DL channel generation
+        self.sionna.phy.config.seed = dl_seed
+
         # Generate DL channel impulse response
         h_dl, tau_dl = self.cdl_dl(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
 
-        # For UL, we use the same geometric parameters but generate a new realization
-        # The CDL model will produce different channel coefficients for the UL frequency
-        h_ul, _ = self.cdl_ul(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
+        # Use a DIFFERENT seed for UL to generate independent small-scale fading
+        # (same path delays/angles/powers, but independent complex gains)
+        self.sionna.phy.config.seed = ul_seed
+
+        # Generate UL channel impulse response
+        h_ul, tau_ul = self.cdl_ul(batch_size=batch_size, num_time_steps=self.ofdm_resource_grid.num_ofdm_symbols, sampling_frequency = 1/self.ofdm_resource_grid.ofdm_symbol_duration)
+
+        # Increment batch index for next call
+        self.batch_index += 1
 
         # Reuse tau_dl for frequency response computation to maintain path correlation
         # This ensures both channels have the same multipath structure
@@ -352,7 +391,13 @@ class SionnaCSIGenerator:
         h_freq_dl = self._impulse_to_frequency_fdd(h_dl, tau_dl, freq_grid)
         h_freq_ul = self._impulse_to_frequency_fdd(h_ul, tau_dl, freq_grid)  # Use same tau for correlation
 
-        return h_freq_dl.cpu().numpy(), h_freq_ul.cpu().numpy(), h_dl, tau_dl
+        # CRITICAL FIX: UL direction="uplink" swaps rx/tx roles in Sionna's cir_to_ofdm_channel.
+        # This causes the output dimensions to be [batch, num_sc, num_tx_ant, num_rx_ant] instead of
+        # [batch, num_sc, num_rx_ant, num_tx_ant]. We must transpose to match DL for fair comparison.
+        h_freq_ul_np = h_freq_ul.cpu().numpy()
+        h_freq_ul_np = np.transpose(h_freq_ul_np, (0, 1, 3, 2))  # swap last two dims
+
+        return h_freq_dl.cpu().numpy(), h_freq_ul_np, h_dl, tau_dl, h_ul, tau_ul
 
     def _impulse_to_frequency_fdd(self, h: torch.Tensor, tau: torch.Tensor,
                                    freq_grid: torch.Tensor) -> torch.Tensor:
@@ -461,25 +506,38 @@ class SionnaCSIGenerator:
         # Reshape to [batch, num_subcarriers, ant_size]
         h_reshaped = h_freq.reshape(batch, num_sc, ant_size)
 
-        # Average over subcarriers to get spatial covariance
-        # Cov = E[h * h^H] where h is spatial channel vector
-        h_spatial = h_reshaped.mean(axis=1)  # [batch, ant_size]
-
-        # Compute covariance: cov[i,j] = E[h_i * conj(h_j)]
-        # Using outer product: cov = h * h^H
+        # Compute sample covariance matrix across all subcarriers
+        # Cov = E[h * h^H] where expectation is over subcarriers
+        # Correct approach: average outer products over subcarriers, NOT outer product of averages
         cov = np.zeros((batch, ant_size, ant_size), dtype=np.float32)
 
         for i in range(batch):
-            h_vec = h_spatial[i]  # [ant_size] complex
-            # Outer product: h[:, None] * h_conj[None, :]
-            h_complex = h_vec.astype(np.complex64)
-            cov[i] = np.real(np.outer(h_complex, np.conj(h_complex)))
+            H = h_reshaped[i]  # [num_subcarriers, ant_size] complex
+            # Sample covariance: (1/N) * H^H @ H = average of h_n * h_n^H over subcarriers
+            cov_complex = (H.T @ np.conj(H)) / num_sc  # [ant_size, ant_size]
+            cov[i] = np.real(cov_complex).astype(np.float32)
 
         # Normalize covariance
         for i in range(batch):
             cov[i] = cov[i] / (np.trace(cov[i]) + 1e-8)
 
-        return cov
+        # Compute eigenvalues of covariance matrix
+        # Using eigh for Hermitian matrices (more numerically stable)
+        eigenvalues = np.zeros((batch, ant_size), dtype=np.float32)
+        eigenvectors = np.zeros((batch, ant_size, ant_size), dtype=np.complex64)
+        for i in range(batch):
+            eigvals, eigvecs = np.linalg.eigh(cov[i])
+            # Sort eigenvalues in descending order
+            idx = np.argsort(eigvals)[::-1]
+            eigenvalues[i] = eigvals[idx]
+            eigenvectors[i] = eigvecs[:, idx]
+
+        # Log eigenvalue statistics for debugging
+        print(f"[DEBUG] Covariance eigenvalues stats:")
+        print(f"  DL: mean={eigenvalues[0].mean():.4f}, max={eigenvalues[0].max():.4f}, min={eigenvalues[0].min():.4f}")
+        print(f"  DL eigenvalue ratios (top5/sum): {eigenvalues[0][:5].sum() / eigenvalues[0].sum():.4f}")
+
+        return cov, eigenvalues, eigenvectors
 
     def _extract_environment_info(self, h: torch.Tensor, tau: torch.Tensor,
                                    h_freq: np.ndarray) -> dict:
@@ -498,12 +556,14 @@ class SionnaCSIGenerator:
         # Clip to configured num_paths (CDL may produce more paths than config.num_paths)
         phases = phases[:, :self.config.num_paths]
         angles_delays = self._extract_dominant_angles_delays(h, tau)
-        covariance = self._compute_covariance_matrix(h_freq)
+        covariance, eigenvalues, eigenvectors = self._compute_covariance_matrix(h_freq)
 
         return {
             'phases': phases,           # [batch, num_paths]
             'angles_delays': angles_delays,  # [batch, num_dominant * 4]
-            'covariance': covariance # [batch, ant_size, ant_size]
+            'covariance': covariance,   # [batch, ant_size, ant_size]
+            'cov_eigenvalues': eigenvalues,  # [batch, ant_size]
+            'cov_eigenvectors': eigenvectors  # [batch, ant_size, ant_size]
         }
 
     def _freq_to_csi_features(self, h_freq: np.ndarray) -> np.ndarray:

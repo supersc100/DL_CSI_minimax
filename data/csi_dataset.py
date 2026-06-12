@@ -78,7 +78,7 @@ class CSIDataset(Dataset):
             ul_csi = self.transform(ul_csi)
 
         # Load environmental info if available and requested
-        env_info = {}
+        env_info = None
         if self.load_env_info and self.has_env_info:
             with h5py.File(self.h5_file, 'r') as f:
                 env_info = {
@@ -87,7 +87,9 @@ class CSIDataset(Dataset):
                     'covariance': torch.from_numpy(f['env_covariance'][idx]).float(),
                 }
 
-        return dl_csi, ul_csi, env_info
+        if env_info is not None:
+            return dl_csi, ul_csi, env_info
+        return dl_csi, ul_csi
 
     def get_normalization_params(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return normalization parameters for later use."""

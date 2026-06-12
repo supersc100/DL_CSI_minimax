@@ -4,12 +4,9 @@ model:
   # Path to Qwen2 model (实际是Qwen2-1.5B，非DeepSeek)
   model_path: "./models/deepseek-1_5b"
 
-  # Model architecture (从Qwen2 config自动检测)
+  # Fallback hidden_dim / max_seq_len (实际从模型 config.json 自动读取)
   hidden_dim: 1536
   max_seq_len: 2048
-  num_hidden_layers: 28
-  num_attention_heads: 12
-  intermediate_size: 8960
 
   # Use flash attention for better memory efficiency
   use_flash_attention: false
@@ -17,10 +14,6 @@ model:
 data:
   # CSI data parameters
   seq_len: 128           # Sequence length for each CSI sample
-  num_features: 2        # Real and imaginary parts
-
-  # Normalization
-  normalize: true
 
 environment:
   # Enable Phase 2: environmental info integration
@@ -35,9 +28,6 @@ environment:
   # Angles/delays dimension: num_dominant_paths * 4 (AoD, AoA, delay, power)
   angles_delays_dim: 20
 
-  # Covariance matrix dimension: num_rx_ant * num_tx_ant
-  cov_dim: 1024  # 16 * 64 = 1024
-
 lora:
   # LoRA fine-tuning configuration
   enabled: true
@@ -46,27 +36,32 @@ lora:
   dropout: 0.05          # LoRA dropout
   target_modules:
     - "q_proj"
-    - "k_proj" 
+    - "k_proj"
     - "v_proj"
     - "o_proj"
 
 training:
   # Training hyperparameters
   epochs: 10
-  batch_size: 1         # Adjust based on GPU memory
-  learning_rate: 1e-5
+  batch_size: 1          # Adjust based on GPU memory
+  gradient_accumulation_steps: 8   # Effective batch_size = batch_size * grad_accum
+  learning_rate: 1e-4    # LoRA 推荐 LR (全量微调建议 1e-5)
   weight_decay: 0.01
-  
+  warmup_ratio: 0.1      # 前 10% steps 线性 warmup
+
   # Gradient clipping
   grad_clip: 1.0
-  
+
   # Logging and checkpointing
-  eval_every: 100        # Steps between evaluations
-  save_every: 500       # Steps between checkpoints
-  log_every: 10         # Steps between log outputs
-  
+  eval_every: 100        # Steps between evaluations (按优化步计数)
+  save_every: 500        # Steps between checkpoints (按优化步计数)
+  log_every: 10          # Steps between log outputs (按优化步计数)
+
   # Limit training steps (useful for debugging)
   max_steps: null
-  
+
   # Number of data loading workers
   num_workers: 2
+
+  # Random seed for reproducibility
+  seed: 42

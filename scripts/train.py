@@ -13,6 +13,8 @@ from pathlib import Path
 import sys
 import os
 import logging
+import random
+import numpy as np
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -48,6 +50,15 @@ def setup_logger(log_file: str) -> logging.Logger:
     return logger
 
 
+def set_seed(seed: int):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -63,7 +74,7 @@ def setup_model(config: dict, device: torch.device, logger: logging.Logger) -> n
 
     # Get model configuration
     model_cfg = config.get('model', {})
-    model_path = model_cfg.get('deepseek_model_path', './models/deepseek-1_5b')
+    model_path = model_cfg.get('model_path', './models/deepseek-1_5b')
 
     # Get environment configuration
     env_cfg = config.get('environment', {})
@@ -72,7 +83,7 @@ def setup_model(config: dict, device: torch.device, logger: logging.Logger) -> n
     env_angles_dim = env_cfg.get('angles_delays_dim', 20)
     env_cov_dim = env_cfg.get('cov_dim', 1024)
 
-    logger.info(f"Loading DeepSeek model from: {model_path}")
+    logger.info(f"Loading model from: {model_path}")
     logger.info(f"Environment info enabled: {use_env_info}")
 
     # Create CSI model
@@ -95,10 +106,12 @@ def setup_model(config: dict, device: torch.device, logger: logging.Logger) -> n
     lora_cfg = config.get('lora', {})
     if lora_cfg.get('enabled', True):
         logger.info("Setting up LoRA fine-tuning...")
+        target_modules = lora_cfg.get('target_modules', ["q_proj", "k_proj", "v_proj", "o_proj"])
         lora_config = LoRAConfig(
             r=lora_cfg.get('rank', 8),
             lora_alpha=lora_cfg.get('alpha', 16),
             lora_dropout=lora_cfg.get('dropout', 0.05),
+            target_modules=target_modules,
         )
         model = setup_lora(model, lora_config)
 
@@ -163,6 +176,11 @@ def main():
     if args.eval_every:
         config['training']['eval_every'] = args.eval_every
 
+    # Set random seed for reproducibility (before model creation)
+    seed = config.get('training', {}).get('seed', 42)
+    set_seed(seed)
+    logger.info(f"Random seed set to {seed}")
+
     # Set device
     if args.device == "cuda" and not torch.cuda.is_available():
         logger.info("CUDA not available, falling back to CPU")
@@ -179,17 +197,15 @@ def main():
     logger.info("Loading CSI Data")
     logger.info("=" * 60)
 
-    # Get environment config
-    env_cfg = config.get('environment', {})
-    load_env_info = env_cfg.get('enabled', False)
-
+    # Always try to load env_info if present in data file;
+    # environment.enabled controls whether the model uses it.
     from data.csi_dataset import CSIDataLoader
     data_loader = CSIDataLoader(
         train_file=f"{args.data_dir}/csi_data_train.h5",
         test_file=f"{args.data_dir}/csi_data_test.h5",
         batch_size=config['training']['batch_size'],
         num_workers=config['training'].get('num_workers', 2),
-        load_env_info=load_env_info,
+        load_env_info=True,  # Auto-detect from HDF5 file
     )
     train_loader = data_loader.train_loader
     test_loader = data_loader.test_loader

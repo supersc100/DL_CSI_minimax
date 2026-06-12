@@ -53,13 +53,13 @@ def main():
     parser.add_argument(
         "--num_tx",
         type=int,
-        default=2,
+        default=16,
         help="Number of transmit antennas",
     )
     parser.add_argument(
         "--num_rx",
         type=int,
-        default=2,
+        default=4,
         help="Number of receive antennas",
     )
     parser.add_argument(

@@ -3,7 +3,7 @@
 *.pyc
 *.h5
 *.log
-*.prompt_init
+# *.prompt_init
 *.json
 *.pt
 prompt_init.txt
